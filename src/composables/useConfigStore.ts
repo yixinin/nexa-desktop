@@ -1,0 +1,175 @@
+import { ref, watch, reactive } from "vue";
+import type { ProxyConfig, ProxyStatus, NodeConfig, LoadBalancingStrategy } from "../types";
+import { detectConnectionType } from "../utils/connection";
+
+const STORAGE_KEY = "pipe-ui-config";
+
+function generateNodeId(): string {
+  return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+const defaultConfig: ProxyConfig = {
+  nodes: [],
+  domains: [],
+  localAddr: "127.0.0.1:8080",
+  dnsAddr: "10.0.0.1:53",
+  upstreamDns: "8.8.8.8:53",
+  loadBalancing: "round_robin",
+  useService: false,
+};
+
+function migrateOldConfig(old: any): ProxyConfig {
+  const config = { ...defaultConfig };
+  const oldDomains = old.domains || [];
+  
+  if (old.connectionType || old.ticket || old.endpointId) {
+    const node: NodeConfig = {
+      id: generateNodeId(),
+      connectionType: old.connectionType || 'ticket',
+      ticket: old.ticket || "",
+      endpointId: old.endpointId || "",
+      domains: oldDomains,
+    };
+    config.nodes = [node];
+  }
+  
+  if (old.domains) {
+    config.domains = oldDomains;
+  }
+  if (old.localAddr) {
+    config.localAddr = old.localAddr;
+  }
+  if (old.dnsAddr) {
+    config.dnsAddr = old.dnsAddr;
+  }
+  if (old.upstreamDns) {
+    config.upstreamDns = old.upstreamDns;
+  }
+  if (old.useService !== undefined) {
+    config.useService = old.useService;
+  }
+  if (old.loadBalancing) {
+    config.loadBalancing = old.loadBalancing;
+  }
+  
+  return config;
+}
+
+function loadConfig(): ProxyConfig {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      if (parsed.nodes && Array.isArray(parsed.nodes)) {
+        parsed.nodes = parsed.nodes.map((node: any) => ({
+          ...node,
+          domains: node.domains || [],
+        }));
+        return { ...defaultConfig, ...parsed };
+      }
+      return migrateOldConfig(parsed);
+    }
+  } catch (e) {
+    console.error("Failed to load config from localStorage:", e);
+  }
+  return { ...defaultConfig };
+}
+
+function saveConfig(config: ProxyConfig) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+  } catch (e) {
+    console.error("Failed to save config to localStorage:", e);
+  }
+}
+
+const config = reactive<ProxyConfig>(loadConfig());
+
+const proxyStatus = ref<ProxyStatus>({ running: false, mode: "stopped" });
+
+watch(
+  () => ({ ...config }),
+  (newConfig) => {
+    saveConfig(newConfig);
+  },
+  { deep: true }
+);
+
+export function useConfigStore() {
+  function updateConfig(newConfig: Partial<ProxyConfig>) {
+    Object.assign(config, newConfig);
+  }
+
+  function addNode(node?: Partial<NodeConfig>) {
+    const newNode: NodeConfig = {
+      id: node?.id || generateNodeId(),
+      connectionType: node?.connectionType || 'ticket',
+      ticket: node?.ticket || "",
+      endpointId: node?.endpointId || "",
+      domains: node?.domains || [],
+    };
+    config.nodes.push(newNode);
+  }
+
+  function removeNode(nodeId: string) {
+    const index = config.nodes.findIndex(n => n.id === nodeId);
+    if (index !== -1) {
+      config.nodes.splice(index, 1);
+    }
+  }
+
+  function updateNode(nodeId: string, updates: Partial<NodeConfig>) {
+    const node = config.nodes.find(n => n.id === nodeId);
+    if (node) {
+      Object.assign(node, updates);
+    }
+  }
+
+  function updateConnectionString(nodeId: string, value: string) {
+    const node = config.nodes.find(n => n.id === nodeId);
+    if (node) {
+      const info = detectConnectionType(value);
+      node.connectionType = info.type;
+      if (info.type === 'ticket') {
+        node.ticket = info.value;
+        node.endpointId = "";
+      } else {
+        node.endpointId = info.value;
+        node.ticket = "";
+      }
+    }
+  }
+
+  function updateNodeDomains(nodeId: string, domains: string[]) {
+    const node = config.nodes.find(n => n.id === nodeId);
+    if (node) {
+      node.domains = domains;
+    }
+  }
+
+  function setLoadBalancing(strategy: LoadBalancingStrategy) {
+    config.loadBalancing = strategy;
+  }
+
+  function setProxyStatus(status: ProxyStatus) {
+    proxyStatus.value = status;
+  }
+
+  function resetConfig() {
+    Object.assign(config, defaultConfig);
+  }
+
+  return {
+    config,
+    proxyStatus,
+    updateConfig,
+    addNode,
+    removeNode,
+    updateNode,
+    updateConnectionString,
+    updateNodeDomains,
+    setLoadBalancing,
+    setProxyStatus,
+    resetConfig,
+  };
+}
