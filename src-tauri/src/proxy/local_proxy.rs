@@ -38,8 +38,9 @@ impl LocalProxyWrapper {
         self.inner.run().await.map_err(|e| anyhow::anyhow!(e))
     }
 
-    pub fn stop(&self) {
+    pub async fn stop(&self) {
         tracing::info!("Stopping local proxy");
         self.inner.stop();
+        self.inner.close_all().await;
     }
 }

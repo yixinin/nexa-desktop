@@ -71,6 +71,7 @@ struct ProxyInstance {
     local_proxy: Option<Arc<LocalProxyWrapper>>,
     dns_stopped: Option<Arc<AtomicBool>>,
     dns_handle: Option<tokio::task::JoinHandle<()>>,
+    endpoint_group: Option<Arc<EndpointGroup>>,
 }
 
 impl ProxyInstance {
@@ -95,7 +96,11 @@ impl ProxyInstance {
         }
 
         if let Some(local_proxy) = self.local_proxy {
-            local_proxy.stop();
+            local_proxy.stop().await;
+        }
+
+        if let Some(endpoint_group) = self.endpoint_group {
+            endpoint_group.close_all().await;
         }
     }
 }
@@ -203,6 +208,7 @@ impl ProxyManager {
                     local_proxy: None,
                     dns_stopped: Some(dns_stopped),
                     dns_handle: Some(dns_handle),
+                    endpoint_group: Some(endpoint_group.clone()),
                 });
                 *self.mode.lock() = Some(ProxyMode::Tun);
 
@@ -253,6 +259,7 @@ impl ProxyManager {
             local_proxy: Some(local_proxy.clone()),
             dns_stopped: None,
             dns_handle: None,
+            endpoint_group: None,
         });
 
         local_proxy.run().await?;
