@@ -23,9 +23,13 @@ impl LocalProxyWrapper {
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-        let inner = LocalProxy::new(&config.listen_addr, config.proxy_domains, endpoint_group)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let inner = LocalProxy::new(
+            &config.listen_addr,
+            config.proxy_domains,
+            Arc::new(endpoint_group),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         tracing::info!("Local proxy created on: {}", config.listen_addr);
 

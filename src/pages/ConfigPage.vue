@@ -75,7 +75,7 @@ watch([localAddr, dnsAddr, upstreamDns, loadBalancing], handleUpdate);
 function loadExampleConfig() {
   localAddr.value = "127.0.0.1:8080";
   dnsAddr.value = "10.0.0.1:53";
-  upstreamDns.value = "8.8.8.8:53";
+  upstreamDns.value = "223.5.5.5:53";
   loadBalancing.value = "round_robin";
   
   if (config.nodes.length === 0) {
@@ -86,7 +86,7 @@ function loadExampleConfig() {
 function clearConfig() {
   localAddr.value = "127.0.0.1:8080";
   dnsAddr.value = "10.0.0.1:53";
-  upstreamDns.value = "8.8.8.8:53";
+  upstreamDns.value = "223.5.5.5:53";
   loadBalancing.value = "round_robin";
 }
 </script>
@@ -277,7 +277,7 @@ function clearConfig() {
               id="upstreamDns"
               v-model="upstreamDns"
               type="text"
-              placeholder="8.8.8.8:53"
+              placeholder="223.5.5.5:53"
               class="form-input"
             />
           </div>

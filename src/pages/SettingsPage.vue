@@ -97,6 +97,39 @@ loadSettings();
 
     <div class="settings-section">
       <div class="card-header">
+        <h2>TUN 设置</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5 12 2"/>
+              <line x1="12" y1="22" x2="12" y2="15.5"/>
+              <line x1="22" y1="8.5" x2="12" y2="15.5"/>
+              <line x1="2" y1="8.5" x2="12" y2="15.5"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">TUN 设备名称</span>
+              <span class="setting-hint">虚拟网卡名称（macOS 由系统自动分配，此项无效）</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <input
+              v-model="config.tunName"
+              class="text-input"
+              placeholder="pipe-tun"
+              maxlength="15"
+              @change="updateConfig({ tunName: config.tunName.trim() || 'pipe-tun' })"
+            />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="card-header">
         <h2>应用设置</h2>
         <div class="card-header-decoration"></div>
       </div>
@@ -435,6 +468,23 @@ loadSettings();
 }
 
 .select-input:focus {
+  outline: none;
+  border-color: var(--primary-500);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+.text-input {
+  width: 160px;
+  padding: 8px 12px;
+  border: 1.5px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  transition: all var(--transition-normal);
+}
+
+.text-input:focus {
   outline: none;
   border-color: var(--primary-500);
   box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);

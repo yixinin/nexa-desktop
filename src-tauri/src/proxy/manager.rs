@@ -1,13 +1,10 @@
-use crate::proxy::dns::{DnsServer, DnsServerConfig, IpMapping};
-use crate::proxy::local_proxy::{LocalProxyWrapper, LocalProxyConfig};
+use crate::proxy::dns::{DnsServerConfig, IpMapping};
+use crate::proxy::local_proxy::{LocalProxyConfig, LocalProxyWrapper};
+use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, TUN_IP};
+use anyhow::Result;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig};
 use nexapipe_client::lb::LoadBalancingStrategy;
-use anyhow::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(windows)]
-use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProxyMode {
@@ -35,7 +32,7 @@ pub enum ProxyLoadBalancingStrategy {
 
 impl std::str::FromStr for ProxyLoadBalancingStrategy {
     type Err = String;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "round_robin" => Ok(Self::RoundRobin),
@@ -61,16 +58,12 @@ pub struct ProxyManagerConfig {
     pub dns_listen_addr: String,
     pub upstream_dns: String,
     pub load_balancing: ProxyLoadBalancingStrategy,
-    #[cfg(windows)]
     pub tun_name: String,
 }
 
 struct ProxyInstance {
-    #[cfg(windows)]
     tun_proxy: Option<Arc<TunProxy>>,
     local_proxy: Option<Arc<LocalProxyWrapper>>,
-    dns_stopped: Option<Arc<AtomicBool>>,
-    dns_handle: Option<tokio::task::JoinHandle<()>>,
     endpoint_group: Option<Arc<EndpointGroup>>,
 }
 
@@ -78,21 +71,9 @@ impl ProxyInstance {
     async fn stop(self) {
         tracing::info!("Stopping proxy instance");
 
-        if let Some(dns_stopped) = self.dns_stopped {
-            dns_stopped.store(true, Ordering::Release);
-        }
-
-        if let Some(dns_handle) = self.dns_handle {
-            if let Err(e) = dns_handle.await {
-                tracing::debug!("DNS handle join error: {:?}", e);
-            }
-        }
-
-        #[cfg(windows)]
-        {
-            if let Some(tun_proxy) = self.tun_proxy {
-                tun_proxy.stop();
-            }
+        // 本地 DNS 服务器由 tun_proxy::run 内部管理，停止 TUN 时自动清理
+        if let Some(tun_proxy) = self.tun_proxy {
+            tun_proxy.stop();
         }
 
         if let Some(local_proxy) = self.local_proxy {
@@ -133,20 +114,22 @@ impl ProxyManager {
             instance.stop().await;
         }
         *self.mode.lock() = None;
-        #[cfg(windows)]
-        {
-            let _ = self.restore_system_dns().await;
-        }
     }
 
     pub async fn start(&self) -> Result<()> {
         tracing::info!("Initializing proxy manager...");
 
-        let all_domains: Vec<String> = self.config.nodes.iter()
+        let all_domains: Vec<String> = self
+            .config
+            .nodes
+            .iter()
             .flat_map(|node| node.domains.iter().cloned())
             .collect();
 
-        let nodes: Vec<NodeConfig> = self.config.nodes.iter()
+        let nodes: Vec<NodeConfig> = self
+            .config
+            .nodes
+            .iter()
             .map(|node| match &node.connection {
                 ConnectionConfig::Ticket(t) => NodeConfig {
                     server_node_id: None,
@@ -161,84 +144,72 @@ impl ProxyManager {
             })
             .collect();
 
-        let endpoint_group = EndpointGroup::new_with_nodes(
-            nodes.clone(),
-            None,
-            self.config.load_balancing.into(),
-        ).await.map_err(|e| anyhow::anyhow!(e))?;
+        let endpoint_group =
+            EndpointGroup::new_with_nodes(nodes.clone(), None, self.config.load_balancing.into())
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
 
         let endpoint_group = Arc::new(endpoint_group);
 
         tracing::info!("EndpointGroup initialized with {} nodes", nodes.len());
 
-        #[cfg(windows)]
-        {
-            if TunProxy::is_available().await {
-                tracing::info!("Admin privileges available, starting TUN + DNS hijack mode");
+        if TunProxy::is_available().await {
+            tracing::info!("Admin privileges available, starting TUN + DNS hijack mode");
 
-                let dns_config = DnsServerConfig {
+            // 本地 DNS 服务器与系统 DNS 切换由 tun_proxy::run 内部完成
+            //（接口配置后启动 DNS，避免 WSAEADDRNOTAVAIL），此处只需构造配置。
+            let dns_ip = self
+                .config
+                .dns_listen_addr
+                .split(':')
+                .next()
+                .unwrap_or(TUN_IP)
+                .to_string();
+            let tun_config = TunProxyConfig {
+                tunnel_name: self.config.tun_name.clone(),
+                dns_ip,
+                dns: DnsServerConfig {
                     listen_addr: self.config.dns_listen_addr.clone(),
                     upstream_dns: self.config.upstream_dns.clone(),
                     proxy_domains: all_domains.clone(),
-                };
-                let dns_server = DnsServer::new(dns_config, self.ip_mapping.clone());
-                let dns_stopped = dns_server.stopped_flag();
+                },
+            };
+            let tun_proxy = Arc::new(TunProxy::new(
+                tun_config,
+                endpoint_group.clone(),
+                self.ip_mapping.clone(),
+            ));
 
-                let dns_handle = tokio::spawn(async move {
-                    if let Err(e) = dns_server.run().await {
-                        tracing::error!("DNS server failed: {}", e);
+            *self.instance.lock() = Some(ProxyInstance {
+                tun_proxy: Some(tun_proxy.clone()),
+                local_proxy: None,
+                endpoint_group: Some(endpoint_group.clone()),
+            });
+            *self.mode.lock() = Some(ProxyMode::Tun);
+
+            // run() 内部负责设备创建、接口/路由/DNS 配置，退出时自动恢复
+            match tun_proxy.run().await {
+                Ok(()) => {
+                    tracing::info!("TUN proxy stopped successfully");
+                    // Properly close endpoints before clearing instance
+                    let instance = self.instance.lock().take();
+                    if let Some(instance) = instance {
+                        instance.stop().await;
                     }
-                });
-
-                if let Err(e) = self.set_system_dns().await {
-                    tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
+                    *self.mode.lock() = None;
+                    return Ok(());
                 }
-
-                let tun_config = TunProxyConfig {
-                    tunnel_name: self.config.tun_name.clone(),
-                };
-                let tun_proxy = Arc::new(TunProxy::new(
-                    tun_config,
-                    endpoint_group.clone(),
-                    self.ip_mapping.clone(),
-                ));
-
-                *self.instance.lock() = Some(ProxyInstance {
-                    tun_proxy: Some(tun_proxy.clone()),
-                    local_proxy: None,
-                    dns_stopped: Some(dns_stopped),
-                    dns_handle: Some(dns_handle),
-                    endpoint_group: Some(endpoint_group.clone()),
-                });
-                *self.mode.lock() = Some(ProxyMode::Tun);
-
-                match tun_proxy.run().await {
-                    Ok(()) => {
-                        tracing::info!("TUN proxy stopped successfully");
-                        let _ = self.restore_system_dns().await;
-                        *self.instance.lock() = None;
-                        *self.mode.lock() = None;
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "TUN proxy failed: {}, falling back to local proxy",
-                            e
-                        );
-                        let _ = self.restore_system_dns().await;
-                        *self.instance.lock() = None;
+                Err(e) => {
+                    tracing::warn!("TUN proxy failed: {}, falling back to local proxy", e);
+                    // Properly close endpoints before clearing instance
+                    let instance = self.instance.lock().take();
+                    if let Some(instance) = instance {
+                        instance.stop().await;
                     }
                 }
-            } else {
-                tracing::warn!(
-                    "Admin privileges not available, falling back to local proxy mode"
-                );
             }
-        }
-
-        #[cfg(not(windows))]
-        {
-            tracing::warn!("TUN is only supported on Windows, using local proxy");
+        } else {
+            tracing::warn!("Admin privileges not available, falling back to local proxy mode");
         }
 
         *self.mode.lock() = Some(ProxyMode::LocalProxy);
@@ -254,68 +225,28 @@ impl ProxyManager {
         let local_proxy = Arc::new(LocalProxyWrapper::new(local_proxy_config).await?);
 
         *self.instance.lock() = Some(ProxyInstance {
-            #[cfg(windows)]
             tun_proxy: None,
             local_proxy: Some(local_proxy.clone()),
-            dns_stopped: None,
-            dns_handle: None,
-            endpoint_group: None,
+            endpoint_group: Some(endpoint_group.clone()),
         });
 
-        local_proxy.run().await?;
+        // Spawn the local proxy run loop as a separate task. This keeps the
+        // large async state machine (handle_local_connection, handle_tls_tunnel,
+        // etc.) off the current task's stack, preventing stack overflow on
+        // tokio worker threads (default 2 MB stack).
+        let run_local_proxy = local_proxy.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_local_proxy.run().await {
+                tracing::error!("Local proxy error: {}", e);
+            }
+        });
 
-        *self.instance.lock() = None;
-        *self.mode.lock() = None;
+        // Local proxy 已在后台任务中运行，start() 直接返回；
+        // 停止由 ProxyManager::stop() 负责，切勿在此清理实例。
         Ok(())
     }
 
     pub async fn get_node_id(&self) -> Option<String> {
         None
-    }
-
-    #[cfg(windows)]
-    async fn set_system_dns(&self) -> Result<()> {
-        let dns_addr = self
-            .config
-            .dns_listen_addr
-            .split(':')
-            .next()
-            .unwrap_or("10.0.0.1");
-
-        let output = std::process::Command::new("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "dnsservers",
-                "all",
-                dns_addr,
-                "primary",
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to run netsh: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("netsh set dns failed: {}", stderr);
-        } else {
-            tracing::info!("System DNS set to {}", dns_addr);
-        }
-
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    async fn restore_system_dns(&self) -> Result<()> {
-        let output = std::process::Command::new("netsh")
-            .args(["interface", "ip", "set", "dnsservers", "all", "dhcp"])
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to run netsh: {}", e))?;
-
-        if output.status.success() {
-            tracing::info!("System DNS restored to DHCP");
-        }
-
-        Ok(())
     }
 }

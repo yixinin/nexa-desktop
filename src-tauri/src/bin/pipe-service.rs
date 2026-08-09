@@ -1,11 +1,10 @@
-use pipe_ui_lib::service::runner::ServiceRunner;
 use pipe_ui_lib::service::platform;
+use pipe_ui_lib::service::runner::ServiceRunner;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // 与服务进程共用日志目录（%APPDATA%/nexapipe/logs），独立前缀避免与 UI 进程冲突
+    let _guard = pipe_ui_lib::init_tracing("nexapipe-service.log");
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -106,7 +105,8 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let status_handle = service_control_handler::register(platform::SERVICE_NAME, event_handler)?;
+        let status_handle =
+            service_control_handler::register(platform::SERVICE_NAME, event_handler)?;
 
         status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,

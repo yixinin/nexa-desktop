@@ -17,6 +17,7 @@ export interface ProxyConfig {
   dnsAddr: string;
   upstreamDns: string;
   loadBalancing: LoadBalancingStrategy;
+  tunName: string;
   useService: boolean;
 }
 

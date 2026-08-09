@@ -83,6 +83,7 @@ function handleUpdate() {
     dnsAddr: dnsAddr.value,
     upstreamDns: upstreamDns.value,
     loadBalancing: loadBalancing.value,
+    tunName: props.config.tunName,
     useService: useService.value,
   });
 }
@@ -299,7 +300,7 @@ onMounted(() => {
           id="upstreamDns"
           v-model="upstreamDns"
           type="text"
-          placeholder="8.8.8.8:53"
+          placeholder="223.5.5.5:53"
           class="form-input"
         />
       </div>

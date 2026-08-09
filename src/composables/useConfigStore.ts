@@ -13,15 +13,16 @@ const defaultConfig: ProxyConfig = {
   domains: [],
   localAddr: "127.0.0.1:8080",
   dnsAddr: "10.0.0.1:53",
-  upstreamDns: "8.8.8.8:53",
+  upstreamDns: "223.5.5.5:53",
   loadBalancing: "round_robin",
+  tunName: "pipe-tun",
   useService: false,
 };
 
 function migrateOldConfig(old: any): ProxyConfig {
   const config = { ...defaultConfig };
   const oldDomains = old.domains || [];
-  
+
   if (old.connectionType || old.ticket || old.endpointId) {
     const node: NodeConfig = {
       id: generateNodeId(),
@@ -32,7 +33,7 @@ function migrateOldConfig(old: any): ProxyConfig {
     };
     config.nodes = [node];
   }
-  
+
   if (old.domains) {
     config.domains = oldDomains;
   }
@@ -48,10 +49,13 @@ function migrateOldConfig(old: any): ProxyConfig {
   if (old.useService !== undefined) {
     config.useService = old.useService;
   }
+  if (old.tunName) {
+    config.tunName = old.tunName;
+  }
   if (old.loadBalancing) {
     config.loadBalancing = old.loadBalancing;
   }
-  
+
   return config;
 }
 

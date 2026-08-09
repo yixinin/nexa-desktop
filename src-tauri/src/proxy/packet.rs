@@ -42,7 +42,6 @@ impl Ipv4Packet {
             payload,
         })
     }
-
 }
 
 /// TCP 标志位

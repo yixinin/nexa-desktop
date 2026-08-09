@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 
 interface LogEntry {
   id: number;
@@ -13,18 +14,49 @@ const filterLevel = ref<string>("all");
 const autoScroll = ref(true);
 const logContainer = ref<HTMLElement | null>(null);
 let logId = 0;
+let loadedLineCount = 0; // 已加载的日志行数，用于增量追加
+const MAX_LOGS = 300; // 前端最多保留的日志条数
 
-const mockLogs: LogEntry[] = [
-  { id: ++logId, timestamp: "14:32:15.234", level: "info", message: "应用启动成功" },
-  { id: ++logId, timestamp: "14:32:15.456", level: "debug", message: "加载配置文件: config.json" },
-  { id: ++logId, timestamp: "14:32:15.789", level: "info", message: "初始化 Iroh 连接池" },
-  { id: ++logId, timestamp: "14:32:16.123", level: "warn", message: "检测到 WinTUN 驱动未安装" },
-  { id: ++logId, timestamp: "14:32:16.345", level: "info", message: "回退到本地代理模式" },
-  { id: ++logId, timestamp: "14:32:17.567", level: "info", message: "DNS 服务启动: 10.0.0.1:53" },
-  { id: ++logId, timestamp: "14:32:17.890", level: "info", message: "HTTP 代理启动: 127.0.0.1:8080" },
-  { id: ++logId, timestamp: "14:32:18.123", level: "debug", message: "连接到远程节点: abc123..." },
-  { id: ++logId, timestamp: "14:32:18.456", level: "info", message: "代理服务运行中" },
-];
+// 解析 Rust tracing 日志行："2026-08-09T13:10:12.363812Z  INFO proxy::dns: msg"
+function parseLogLine(line: string): LogEntry | null {
+  if (!line.trim()) return null;
+  const trimmed = line.replace(/\x1b\[[0-9;]*m/g, "").trim(); // 去除 ANSI 颜色码
+  const firstSpace = trimmed.indexOf(" ");
+  const timestamp = firstSpace > 0 ? trimmed.slice(0, firstSpace) : "";
+  const rest = firstSpace > 0 ? trimmed.slice(firstSpace).trim() : trimmed;
+
+  const levelToken = rest.split(/\s+/)[0] || "";
+  const level = levelToken.toUpperCase() as LogEntry["level"];
+  const validLevels = ["TRACE", "DEBUG", "INFO", "WARN", "ERROR"];
+  if (!validLevels.includes(level)) {
+    // 非标准格式（如纯文本行），整行作为消息
+    return { id: ++logId, timestamp, level: "info", message: trimmed };
+  }
+
+  const message = rest.slice(levelToken.length).trim();
+  return { id: ++logId, timestamp, level: level.toLowerCase() as LogEntry["level"], message };
+}
+
+async function loadLogs(appendOnly: boolean) {
+  try {
+    const lines = await invoke<string[]>("get_logs", { limit: MAX_LOGS });
+    if (appendOnly && lines.length <= loadedLineCount) return;
+
+    const start = appendOnly ? loadedLineCount : 0;
+    const entries = lines
+      .slice(start)
+      .map(parseLogLine)
+      .filter((l): l is LogEntry => l !== null);
+    logs.value.push(...entries);
+    if (logs.value.length > MAX_LOGS) {
+      logs.value = logs.value.slice(-MAX_LOGS);
+    }
+    loadedLineCount = lines.length;
+    scrollToBottom();
+  } catch (e) {
+    console.error("Failed to load logs:", e);
+  }
+}
 
 function getLevelColor(level: string) {
   switch (level) {
@@ -73,6 +105,7 @@ function scrollToBottom() {
 
 function clearLogs() {
   logs.value = [];
+  loadedLineCount = 0; // 下次轮询会重新加载当前文件内容
 }
 
 function copyLogs() {
@@ -84,40 +117,12 @@ function copyLogs() {
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
 
-onMounted(() => {
-  logs.value = [...mockLogs];
-  
+onMounted(async () => {
+  await loadLogs(false);
+  // 每 2 秒增量拉取新日志
   intervalId = setInterval(() => {
-    const levels: LogEntry["level"][] = ["trace", "debug", "info", "warn", "error"];
-    const messages = [
-      "处理 DNS 查询: example.com",
-      "转发请求到远程节点",
-      "连接池连接数: 5",
-      "DNS 缓存命中: api.example.com",
-      "收到新的代理请求",
-      "连接心跳检测",
-      "清理过期连接",
-    ];
-    
-    const now = new Date();
-    const timestamp = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}.${String(now.getMilliseconds()).padStart(3, '0')}`;
-    
-    const newLog: LogEntry = {
-      id: ++logId,
-      timestamp,
-      level: levels[Math.floor(Math.random() * levels.length)],
-      message: messages[Math.floor(Math.random() * messages.length)],
-    };
-    
-    logs.value.push(newLog);
-    
-    if (logs.value.length > 100) {
-      logs.value = logs.value.slice(-100);
-    }
-    
-    scrollToBottom();
+    loadLogs(true);
   }, 2000);
-  
   scrollToBottom();
 });
 

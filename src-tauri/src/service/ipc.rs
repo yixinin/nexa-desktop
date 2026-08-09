@@ -18,6 +18,7 @@ pub struct StartProxyRequest {
     pub dns_addr: Option<String>,
     pub upstream_dns: Option<String>,
     pub load_balancing: Option<String>,
+    pub tun_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

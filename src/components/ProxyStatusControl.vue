@@ -142,6 +142,7 @@ async function startProxy() {
       dnsAddr: props.config.dnsAddr,
       upstreamDns: props.config.upstreamDns,
       loadBalancing: props.config.loadBalancing,
+      tunName: props.config.tunName,
       useService: props.config.useService,
     });
     

@@ -1,4 +1,4 @@
-use crate::service::ipc::{IpcMessage, IpcResponse, IPC_SOCKET_PATH, StartProxyRequest, NodeInput};
+use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, StartProxyRequest, IPC_SOCKET_PATH};
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -47,6 +47,7 @@ impl IpcClient {
         dns_addr: Option<String>,
         upstream_dns: Option<String>,
         load_balancing: Option<String>,
+        tun_name: Option<String>,
     ) -> Result<String> {
         let response = Self::send_message(IpcMessage::StartProxy(StartProxyRequest {
             nodes,
@@ -55,7 +56,9 @@ impl IpcClient {
             dns_addr,
             upstream_dns,
             load_balancing,
-        })).await?;
+            tun_name,
+        }))
+        .await?;
 
         match response {
             IpcResponse::Ok(msg) => Ok(msg),

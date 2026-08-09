@@ -1,11 +1,9 @@
-
-
 pub const SERVICE_NAME: &str = "pipe-service";
 pub const SERVICE_DISPLAY_NAME: &str = "Pipe Service";
 
 pub fn install_service() -> Result<String, String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
     let exe_str = exe_path.to_string_lossy().to_string();
 
     #[cfg(windows)]
@@ -174,9 +172,13 @@ fn uninstall_service_linux() -> Result<String, String> {
     use std::path::Path;
     use std::process::Command;
 
-    let _ = Command::new("systemctl").args(["stop", SERVICE_NAME]).output();
+    let _ = Command::new("systemctl")
+        .args(["stop", SERVICE_NAME])
+        .output();
 
-    let _ = Command::new("systemctl").args(["disable", SERVICE_NAME]).output();
+    let _ = Command::new("systemctl")
+        .args(["disable", SERVICE_NAME])
+        .output();
 
     let unit_path = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
     let _ = fs::remove_file(unit_path);
@@ -231,13 +233,14 @@ fn install_service_macos(exe_path: &str) -> Result<String, String> {
         SERVICE_NAME, exe_path
     );
 
-    let plist_path = PathBuf::from("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
+    let plist_path =
+        PathBuf::from("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
 
     fs::create_dir_all("/Library/LaunchDaemons")
         .map_err(|e| format!("Failed to create LaunchDaemons directory: {}", e))?;
 
-    let mut file = File::create(&plist_path)
-        .map_err(|e| format!("Failed to create plist file: {}", e))?;
+    let mut file =
+        File::create(&plist_path).map_err(|e| format!("Failed to create plist file: {}", e))?;
 
     file.write_all(plist_content.as_bytes())
         .map_err(|e| format!("Failed to write plist file: {}", e))?;
@@ -261,9 +264,12 @@ fn uninstall_service_macos() -> Result<String, String> {
     use std::path::Path;
     use std::process::Command;
 
-    let plist_path = Path::new("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
+    let plist_path =
+        Path::new("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
 
-    let _ = Command::new("launchctl").args(["unload", plist_path.to_str().unwrap()]).output();
+    let _ = Command::new("launchctl")
+        .args(["unload", plist_path.to_str().unwrap()])
+        .output();
     let _ = fs::remove_file(&plist_path);
 
     Ok("Service uninstalled".to_string())
@@ -278,7 +284,8 @@ fn is_service_running_macos() -> bool {
         .output()
         .ok()?;
 
-    output.status.success() && !String::from_utf8_lossy(&output.stdout).contains("Could not find service")
+    output.status.success()
+        && !String::from_utf8_lossy(&output.stdout).contains("Could not find service")
 }
 
 pub fn start_service() -> Result<String, String> {
@@ -382,7 +389,8 @@ fn start_service_macos() -> Result<String, String> {
     use std::path::Path;
     use std::process::Command;
 
-    let plist_path = Path::new("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
+    let plist_path =
+        Path::new("/Library/LaunchDaemons").join(format!("com.pipe.{}.plist", SERVICE_NAME));
 
     let output = Command::new("launchctl")
         .args(["start", format!("com.pipe.{}", SERVICE_NAME).as_str()])

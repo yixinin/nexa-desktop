@@ -1,5 +1,7 @@
-use crate::proxy::{ProxyManager, ProxyManagerConfig, ProxyNodeConfig, ConnectionConfig, ProxyLoadBalancingStrategy};
-use crate::service::ipc::{IpcMessage, IpcResponse, IPC_SOCKET_PATH, NodeInput};
+use crate::proxy::{
+    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
+};
+use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, IPC_SOCKET_PATH};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,7 +28,10 @@ impl ServiceRunner {
         tracing::info!("IPC server listening on: {}", IPC_SOCKET_PATH);
 
         loop {
-            let (mut stream, _) = listener.accept().await.context("Failed to accept connection")?;
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .context("Failed to accept connection")?;
             tracing::debug!("Client connected");
 
             let proxy_manager = self.proxy_manager.clone();
@@ -57,22 +62,25 @@ impl ServiceRunner {
                 break;
             }
 
-            let msg: IpcMessage = serde_json::from_str(&buffer)
-                .context("Failed to parse IPC message")?;
+            let msg: IpcMessage =
+                serde_json::from_str(&buffer).context("Failed to parse IPC message")?;
 
             tracing::debug!("Received IPC message: {:?}", msg);
 
             let response = match msg {
-                IpcMessage::StartProxy(req) => Self::handle_start_proxy(
-                    req.nodes,
-                    req.domains,
-                    req.local_addr,
-                    req.dns_addr,
-                    req.upstream_dns,
-                    req.load_balancing,
-                    &proxy_manager,
-                )
-                .await,
+                IpcMessage::StartProxy(req) => {
+                    Self::handle_start_proxy(
+                        req.nodes,
+                        req.domains,
+                        req.local_addr,
+                        req.dns_addr,
+                        req.upstream_dns,
+                        req.load_balancing,
+                        req.tun_name,
+                        &proxy_manager,
+                    )
+                    .await
+                }
                 IpcMessage::StopProxy => Self::handle_stop_proxy(&proxy_manager).await,
                 IpcMessage::GetStatus => Self::handle_get_status(&proxy_manager).await,
                 IpcMessage::GetNodeId => Self::handle_get_node_id(&proxy_manager).await,
@@ -80,8 +88,8 @@ impl ServiceRunner {
                 IpcMessage::UninstallService => Self::handle_uninstall_service().await,
             };
 
-            let response_str = serde_json::to_string(&response)
-                .context("Failed to serialize response")?;
+            let response_str =
+                serde_json::to_string(&response).context("Failed to serialize response")?;
 
             reader
                 .get_mut()
@@ -100,9 +108,11 @@ impl ServiceRunner {
         dns_addr: Option<String>,
         upstream_dns: Option<String>,
         load_balancing: Option<String>,
+        tun_name: Option<String>,
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
-        let parsed_nodes: Vec<ProxyNodeConfig> = nodes.into_iter()
+        let parsed_nodes: Vec<ProxyNodeConfig> = nodes
+            .into_iter()
             .filter(|n| !n.ticket.is_empty() || !n.endpoint_id.is_empty())
             .map(|n| {
                 let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
@@ -110,7 +120,7 @@ impl ServiceRunner {
                 } else {
                     ConnectionConfig::EndpointId(n.endpoint_id)
                 };
-                ProxyNodeConfig { 
+                ProxyNodeConfig {
                     connection,
                     domains: n.domains,
                 }
@@ -131,8 +141,7 @@ impl ServiceRunner {
         let dns_addr = dns_addr.unwrap_or_else(|| "10.0.0.1:53".to_string());
         let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
 
-        #[cfg(windows)]
-        let tun_name = "pipe-ui-tun".to_string();
+        let tun_name = tun_name.unwrap_or_else(|| "pipe-tun".to_string());
 
         let config = ProxyManagerConfig {
             nodes: parsed_nodes,
@@ -140,7 +149,6 @@ impl ServiceRunner {
             dns_listen_addr: dns_addr,
             upstream_dns,
             load_balancing,
-            #[cfg(windows)]
             tun_name,
         };
 
@@ -163,7 +171,9 @@ impl ServiceRunner {
         IpcResponse::Ok("Proxy started".to_string())
     }
 
-    async fn handle_stop_proxy(proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>) -> IpcResponse {
+    async fn handle_stop_proxy(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
         let pm = proxy_manager.write().await;
         if let Some(manager) = pm.as_ref() {
             manager.stop().await;
@@ -171,7 +181,9 @@ impl ServiceRunner {
         IpcResponse::Ok("Proxy stopped".to_string())
     }
 
-    async fn handle_get_status(proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>) -> IpcResponse {
+    async fn handle_get_status(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
         let pm = proxy_manager.read().await;
         if let Some(manager) = pm.as_ref() {
             match manager.get_mode() {
@@ -192,7 +204,9 @@ impl ServiceRunner {
         }
     }
 
-    async fn handle_get_node_id(proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>) -> IpcResponse {
+    async fn handle_get_node_id(
+        proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
+    ) -> IpcResponse {
         let pm = proxy_manager.read().await;
         if let Some(manager) = pm.as_ref() {
             match manager.get_node_id().await {

@@ -1,9 +1,11 @@
 pub mod dns;
+pub mod dns_config;
 pub mod local_proxy;
 pub mod manager;
 pub mod packet;
-
-#[cfg(windows)]
+pub mod routing;
 pub mod tun_proxy;
 
-pub use manager::{ProxyManager, ProxyManagerConfig, ProxyNodeConfig, ConnectionConfig, ProxyLoadBalancingStrategy};
+pub use manager::{
+    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
+};

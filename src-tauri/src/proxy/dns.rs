@@ -2,13 +2,13 @@ use anyhow::Result;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 /// 虚拟 IP 起始地址（10.0.0.2 ~ 10.0.0.254）
 const VIRTUAL_IP_START: u32 = 0x0A000002; // 10.0.0.2
-const VIRTUAL_IP_END: u32 = 0x0A0000FE;   // 10.0.0.254
+const VIRTUAL_IP_END: u32 = 0x0A0000FE; // 10.0.0.254
 
 /// IP -> 域名 映射表
 #[derive(Debug)]
@@ -61,7 +61,6 @@ impl IpMapping {
         let ip_u32 = u32::from(*ip);
         self.ip_to_domain.lock().get(&ip_u32).cloned()
     }
-
 }
 
 /// DNS 服务器配置
@@ -92,11 +91,20 @@ impl DnsServer {
         self.stopped.clone()
     }
 
-    /// 启动 DNS 服务器
-    pub async fn run(&self) -> Result<()> {
+    /// 绑定 DNS 监听 socket（eager bind）。
+    ///
+    /// 调用方必须先确认绑定成功，再把系统 DNS 指向 listen_addr，否则系统 DNS
+    /// 会指向一个没人监听的地址，导致整机 DNS 解析失败（iroh relay 也会随之断连）。
+    /// Windows 上若 TUN 接口地址（10.0.0.1）尚未就绪，这里会返回
+    /// WSAEADDRNOTAVAIL (10049)。
+    pub async fn bind(&self) -> Result<Arc<UdpSocket>> {
         let socket = Arc::new(UdpSocket::bind(&self.config.listen_addr).await?);
         tracing::info!("DNS server listening on: {}", self.config.listen_addr);
+        Ok(socket)
+    }
 
+    /// 使用已绑定的 socket 运行 DNS 服务器主循环。
+    pub async fn run_with_socket(&self, socket: Arc<UdpSocket>) -> Result<()> {
         let upstream = self.config.upstream_dns.clone();
         let proxy_domains = Arc::new(self.config.proxy_domains.clone());
         let ip_mapping = self.ip_mapping.clone();
@@ -112,7 +120,9 @@ impl DnsServer {
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
                 socket.recv_from(&mut buf),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok((len, addr))) => {
                     let data = buf[..len].to_vec();
                     let socket = socket.clone();
@@ -169,45 +179,85 @@ async fn handle_dns_query(
         }
     };
 
-    tracing::debug!(
-        "DNS query: {} (type {})",
-        query.domain,
-        query.qtype
-    );
+    tracing::debug!("DNS query: {} (type {})", query.domain, query.qtype);
 
-    // 检查域名是否在代理列表中
-    if query.qtype == 1 && should_proxy_domain(&query.domain, proxy_domains) {
-        // DNS 劫持：返回虚拟 IP
+    // 检查域名是否在代理列表中（支持子域后缀匹配）
+    if should_proxy_domain(&query.domain, proxy_domains) {
         let virtual_ip = ip_mapping.allocate(&query.domain);
         tracing::info!("DNS hijack: {} -> {}", query.domain, virtual_ip);
 
-        let response = build_dns_response(data, &query, virtual_ip);
+        // A 记录返回虚拟 IP；AAAA 等其余类型返回 NOERROR 空应答，
+        // 避免向上游泄漏查询且不干扰浏览器解析
+        let response = if query.qtype == 1 {
+            build_dns_response(data, &query, virtual_ip)
+        } else {
+            build_empty_dns_response(&query)
+        };
         socket.send_to(&response, client_addr).await?;
         return Ok(());
     }
 
-    // 非代理域名：转发到上游 DNS
-    let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
-    upstream_socket.send_to(data, upstream).await?;
+    // 非代理域名：转发到上游 DNS（配置的上游不可达时自动兜底其他公共 DNS）
+    forward_to_upstream(socket, data, client_addr, upstream).await
+}
 
-    let mut buf = [0u8; 4096];
-    match tokio::time::timeout(
-        tokio::time::Duration::from_secs(5),
-        upstream_socket.recv_from(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok((len, _))) => {
-            socket.send_to(&buf[..len], client_addr).await?;
-        }
-        Ok(Err(e)) => {
-            tracing::debug!("Upstream DNS error: {}", e);
-        }
-        Err(_) => {
-            tracing::debug!("Upstream DNS timeout");
+/// 兜底上游 DNS 列表（当用户配置的上游超时/不可达时依次尝试）。
+/// 默认 8.8.8.8 在部分网络（如国内直连）不可达，会导致 iroh relay 域名
+/// 解析失败（"No addressing information available"），故按序兜底到国内可达的公共 DNS。
+const FALLBACK_UPSTREAMS: &[&str] = &[
+    "223.5.5.5:53",       // 阿里 DNS
+    "114.114.114.114:53", // 114 DNS
+    "1.1.1.1:53",         // Cloudflare
+];
+
+/// 依次向配置的上游与兜底上游转发 DNS 查询，返回第一个成功应答；
+/// 每个上游等待 1.5s，且只接受来自所查询上游的响应（防伪造）。
+async fn forward_to_upstream(
+    socket: &Arc<UdpSocket>,
+    data: &[u8],
+    client_addr: std::net::SocketAddr,
+    configured_upstream: &str,
+) -> Result<()> {
+    // 去重构建上游列表：用户配置优先，兜底随后
+    let mut upstreams: Vec<String> = Vec::new();
+    if !upstreams.iter().any(|u| u == configured_upstream) {
+        upstreams.push(configured_upstream.to_string());
+    }
+    for fb in FALLBACK_UPSTREAMS {
+        if !upstreams.iter().any(|u| u == fb) {
+            upstreams.push(fb.to_string());
         }
     }
 
+    for upstream in upstreams {
+        let upstream_addr: std::net::SocketAddr = match upstream.parse() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        let upstream_socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if upstream_socket.send_to(data, upstream_addr).await.is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 4096];
+        match tokio::time::timeout(
+            tokio::time::Duration::from_millis(1500),
+            upstream_socket.recv_from(&mut buf),
+        )
+        .await
+        {
+            // 只接受来自所查询上游的响应，防止伪造/无关 UDP 包被转发给客户端
+            Ok(Ok((len, src))) if src == upstream_addr => {
+                socket.send_to(&buf[..len], client_addr).await?;
+                return Ok(());
+            }
+            _ => continue, // 超时/来源不符/错误：尝试下一个上游
+        }
+    }
+
+    tracing::debug!("All upstream DNS servers failed for query");
     Ok(())
 }
 
@@ -279,7 +329,7 @@ fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: Ipv4Addr) -> Vec<u
 
     // Header
     response.extend_from_slice(&dns_query.id.to_be_bytes()); // ID
-    // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
+                                                             // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
     response.extend_from_slice(&[0x81, 0x80]);
     // QDCOUNT=1
     response.extend_from_slice(&1u16.to_be_bytes());
@@ -310,18 +360,34 @@ fn build_dns_response(query: &[u8], dns_query: &DnsQuery, ip: Ipv4Addr) -> Vec<u
     response
 }
 
-/// 检查域名是否应该被代理
+/// 检查域名是否应该被代理（DOMAIN-SUFFIX 语义）：
+/// - `example.com` 匹配 `example.com` 及其所有子域名（如 `fn.example.com`）
+/// - `*.example.com` / `.example.com` 兼容写法，语义相同
 fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
     let host_lower = host.to_lowercase();
     for domain in proxy_domains {
-        if domain.starts_with('*') {
-            let suffix = &domain[1..];
-            if host_lower.ends_with(suffix) {
-                return true;
-            }
-        } else if host_lower == domain.to_lowercase() {
+        let domain_lower = domain
+            .trim_start_matches('*')
+            .trim_start_matches('.')
+            .to_lowercase();
+        if host_lower == domain_lower || host_lower.ends_with(&format!(".{}", domain_lower)) {
             return true;
         }
     }
     false
+}
+
+/// 构造 NOERROR 空应答（用于 AAAA 等劫持域名的非 A 记录查询）
+fn build_empty_dns_response(dns_query: &DnsQuery) -> Vec<u8> {
+    let mut response = Vec::with_capacity(dns_query.question_section.len() + 16);
+    // Header：ID + QR=1, RD=1, RA=1, RCODE=0 + QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    response.extend_from_slice(&dns_query.id.to_be_bytes());
+    response.extend_from_slice(&[0x81, 0x80]);
+    response.extend_from_slice(&1u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    // Question section（原样复制）
+    response.extend_from_slice(&dns_query.question_section);
+    response
 }

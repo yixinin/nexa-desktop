@@ -1,25 +1,53 @@
-use crate::proxy::dns::IpMapping;
+//! TUN 代理 — 跨平台实现（Windows: wintun / Linux: /dev/net/tun / macOS: utun）。
+//!
+//! 数据流：
+//! ```text
+//! APP → TUN 设备 → AsyncDevice::recv() → 解析 IP/TCP 包
+//!                                            ↓
+//!                         根据目标虚拟 IP 查 IpMapping 得到域名
+//!                                            ↓
+//!                             打开 iroh 双向流转发数据
+//!                                            ↓
+//!                     构造 TCP 应答包 → AsyncDevice::send() → TUN 设备 → APP
+//! ```
+//!
+//! 虚拟网络（与 dns.rs 的 IpMapping 分配一致）：
+//! - 10.0.0.1   = TUN 设备自身地址 / DNS 服务器地址
+//! - 10.0.0.2+  = 代理域名映射的虚拟 IP（DNS 劫持返回）
+//!
+//! 系统路由：接口配置为 10.0.0.1/24 后内核自动添加 10.0.0.0/24 直连路由，
+//! 虚拟 IP 的流量全部进入 TUN 设备；系统 DNS 指向 10.0.0.1（见 dns_config.rs）。
+//!
+//! 平台差异：
+//! - Windows: tun crate 内部创建 wintun 适配器，需先加载 wintun.dll
+//! - Linux:   tun crate 创建 /dev/net/tun 设备，名称任意（≤15 字符）
+//! - macOS:   设备名必须是 utunN 形式，不指定名字时由系统自动分配
+
+use crate::proxy::dns::{DnsServer, DnsServerConfig, IpMapping};
 use crate::proxy::packet::{tcp_flags, Ipv4Packet, TcpPacket, IPPROTO_TCP};
+use crate::proxy::{dns_config, routing};
 use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tun::AbstractDevice;
 
-fn target_arch_dir() -> &'static str {
-    #[cfg(target_arch = "x86_64")]
-    { "amd64" }
-    #[cfg(target_arch = "x86")]
-    { "x86" }
-    #[cfg(target_arch = "arm")]
-    { "arm" }
-    #[cfg(target_arch = "aarch64")]
-    { "arm64" }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "arm", target_arch = "aarch64")))]
-    { "amd64" }
-}
+/// TUN 设备自身 IP（同时是本地 DNS 服务器地址）
+pub const TUN_IP: &str = "10.0.0.1";
+pub const TUN_NETMASK: &str = "255.255.255.0";
+/// 虚拟网段 — 必须与 dns.rs 的 VIRTUAL_IP_START/END（10.0.0.2 ~ 10.0.0.254）一致。
+/// 仅 Linux 的 routing 模块使用，其他平台由接口地址自动生成直连路由。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const TUN_NETWORK: &str = "10.0.0.0/24";
+const TUN_MTU: usize = 1500;
+/// 读循环超时 — 用于及时响应 stop() 信号
+const READ_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum TcpState {
@@ -48,6 +76,10 @@ struct Connection {
 #[derive(Debug, Clone)]
 pub struct TunProxyConfig {
     pub tunnel_name: String,
+    /// 系统 DNS 需要指向的地址（TUN 虚拟 IP，通常为 10.0.0.1）
+    pub dns_ip: String,
+    /// 本地 DNS 服务器配置（DNS 劫持）
+    pub dns: DnsServerConfig,
 }
 
 pub struct TunProxy {
@@ -80,121 +112,209 @@ impl TunProxy {
         self.stopped.store(true, Ordering::Release);
     }
 
+    /// 当前进程是否有权限创建 TUN 设备（Windows: 管理员 / Unix: root）
     pub fn is_admin() -> bool {
-        std::process::Command::new("net")
-            .arg("session")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        #[cfg(windows)]
+        {
+            std::process::Command::new("net")
+                .arg("session")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        #[cfg(unix)]
+        {
+            unsafe { libc::geteuid() == 0 }
+        }
     }
 
     pub async fn is_available() -> bool {
         Self::is_admin()
     }
 
+    /// 启动 TUN 代理：创建设备 → 配置地址/路由 → 启动本地 DNS → 切换系统 DNS
+    /// → 运行包循环 → 清理恢复。
+    ///
+    /// 顺序至关重要：本地 DNS 服务器必须绑定在 10.0.0.1:53 上，
+    /// 而该地址是 TUN 接口地址，必须先配置接口再启动 DNS 服务器，
+    /// 否则 Windows 会报 WSAEADDRNOTAVAIL (10049) 绑定失败。
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Starting TUN proxy with DNS hijacking");
-        #[cfg(windows)]
-        { self.run_wintun().await }
-        #[cfg(not(windows))]
-        { Err(anyhow::anyhow!("TUN is only supported on Windows")) }
-    }
-}
 
-#[cfg(windows)]
-impl TunProxy {
-    async fn run_wintun(&self) -> Result<()> {
-        tracing::info!("Loading WinTUN driver...");
-        let arch_dir = target_arch_dir();
-        let wintun_path = if let Ok(path) = std::env::var("WINTUN_PATH") {
-            path
-        } else {
-            format!("wintun/bin/{}/wintun.dll", arch_dir)
-        };
-        let wintun = unsafe { wintun::load_from_path(&wintun_path) }
-            .map_err(|e| anyhow::anyhow!(
-                "Failed to load wintun.dll from {}: {:?}", wintun_path, e
-            ))?;
-        let adapter = wintun::Adapter::create(&wintun, &self.config.tunnel_name, "pipe-ui", None)
-            .map_err(|e| anyhow::anyhow!("Failed to create TUN adapter: {:?}", e))?;
-        self.configure_interface().await?;
-        let session = adapter.start_session(0x400000)
-            .map_err(|e| anyhow::anyhow!("Failed to start TUN session: {:?}", e))?;
-        let session_arc = Arc::new(session);
-        let session_rx = session_arc.clone();
-        let connections_rx = self.connections.clone();
-        let endpoint_group_rx = self.endpoint_group.clone();
-        let ip_mapping_rx = self.ip_mapping.clone();
-        let identification_rx = self.identification.clone();
-        let stopped_rx = self.stopped.clone();
-        let rx_handle = tokio::task::spawn_blocking(move || {
-            loop {
-                if stopped_rx.load(Ordering::Acquire) {
-                    tracing::info!("TUN stopping due to stop flag");
-                    break;
-                }
-                match session_rx.receive_blocking() {
-                    Ok(packet_data) => {
-                        let data = packet_data.bytes().to_vec();
-                        let session = session_rx.clone();
-                        let connections = connections_rx.clone();
-                        let endpoint_group = endpoint_group_rx.clone();
-                        let ip_mapping = ip_mapping_rx.clone();
-                        let identification = identification_rx.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_packet(&data, &session, &connections, &endpoint_group, &ip_mapping, &identification).await {
-                                tracing::debug!("Packet handling error: {}", e);
-                            }
-                        });
-                    }
-                    Err(wintun::Error::ShuttingDown) => { break; }
-                    Err(e) => { tracing::error!("TUN receive error: {:?}", e); break; }
-                }
+        let device = Arc::new(self.create_device()?);
+        let interface = device.tun_name()?;
+        tracing::info!(
+            "TUN device ready: {} (mtu {})",
+            interface,
+            device.mtu().unwrap_or(TUN_MTU as u16)
+        );
+
+        // 1. 配置接口地址 / 路由（幂等）——10.0.0.1 必须已存在于本机
+        routing::configure_interface(&interface)?;
+        routing::add_routes(&interface)?;
+
+        // 2. 绑定本地 DNS 服务器（DNS 劫持）。
+        //    必须先确认绑定成功，再把系统 DNS 指向 10.0.0.1，否则系统 DNS
+        //    会指向一个没人监听的地址，导致整机 DNS（含 iroh relay 解析）挂掉。
+        //    Windows 上接口地址未就绪时 bind 会报 WSAEADDRNOTAVAIL (10049)，
+        //    这里直接失败退出（manager 会回退 local proxy），而不是带病运行。
+        let dns_server = DnsServer::new(self.config.dns.clone(), self.ip_mapping.clone());
+        let dns_socket = dns_server.bind().await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to bind DNS server on {}: {}. Ensure the TUN interface {} is configured with {} and port 53 is free.",
+                self.config.dns.listen_addr,
+                e,
+                interface,
+                TUN_IP
+            )
+        })?;
+        let dns_stopped = dns_server.stopped_flag();
+        let dns_handle = tokio::spawn(async move {
+            if let Err(e) = dns_server.run_with_socket(dns_socket).await {
+                tracing::error!("DNS server failed: {}", e);
             }
         });
-        rx_handle.await?;
-        tracing::info!("TUN proxy stopped");
-        Ok(())
+
+        // 3. 将系统 DNS 指向虚拟 IP — 必须在 DNS 服务器成功绑定之后
+        if let Err(e) = dns_config::set_system_dns(&interface, &self.config.dns_ip) {
+            tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
+        }
+
+        let result = self.run_device(&device).await;
+
+        // 清理（尽力而为）：先恢复系统 DNS，再停止本地 DNS 服务器，最后移除路由
+        if let Err(e) = dns_config::restore_system_dns(&interface, &self.config.dns_ip) {
+            tracing::warn!("Failed to restore system DNS: {}", e);
+        }
+        dns_stopped.store(true, Ordering::Release);
+        if let Err(e) = dns_handle.await {
+            tracing::debug!("DNS handle join error: {:?}", e);
+        }
+        if let Err(e) = routing::remove_routes(&interface) {
+            tracing::warn!("Failed to remove TUN routes: {}", e);
+        }
+        result
     }
 
-    async fn configure_interface(&self) -> Result<()> {
-        let adapter_name = &self.config.tunnel_name;
-        let output = std::process::Command::new("netsh")
-            .args([
-                "interface", "ip", "set", "address",
-                &format!("name={}", adapter_name), "static", "10.0.0.1", "255.255.255.0", "10.0.0.1",
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to run netsh: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("netsh set address failed: {}", stderr);
+    /// 创建 TUN 设备。Windows 上需先定位 wintun.dll 并显式指定给 tun crate
+    /// （不能依赖系统 DLL 搜索——wintun-bindings 的 load_from_path("wintun.dll")
+    /// 在搜索失败时会误对 exe 自身做签名校验，导致 "The file is not signed."）；
+    /// macOS 上不指定名字，由系统自动分配 utunN。
+    fn create_device(&self) -> Result<tun::AsyncDevice> {
+        #[cfg(windows)]
+        let wintun_path = find_wintun_path().ok_or_else(|| {
+            anyhow::anyhow!(
+                "wintun.dll not found. 请确认 build.rs 已将其复制到 exe 目录，\
+                 或设置 WINTUN_PATH 环境变量指向 wintun.dll"
+            )
+        })?;
+        #[cfg(windows)]
+        tracing::info!("Using wintun.dll at {}", wintun_path.display());
+
+        let mut config = tun::Configuration::default();
+        // 显式指定 wintun.dll 绝对路径：绕开 wintun-bindings 的系统搜索 + 签名校验 bug
+        #[cfg(windows)]
+        config.platform_config(|pc| {
+            pc.wintun_file(wintun_path.clone());
+        });
+        #[cfg(not(target_os = "macos"))]
+        config.tun_name(&self.config.tunnel_name);
+        config.mtu(TUN_MTU as u16);
+        // 地址/路由由 routing::configure_interface 统一配置（幂等），
+        // 避免与 ip/ifconfig/netsh 命令冲突。Windows 下 tun crate 直接创建 wintun 适配器。
+
+        let device = tun::create_as_async(&config)?;
+        Ok(device)
+    }
+
+    /// 运行包处理循环：读 TUN → 解析 → 分发到 handle_packet。
+    async fn run_device(&self, device: &Arc<tun::AsyncDevice>) -> Result<()> {
+        let mut buf = vec![0u8; TUN_MTU];
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                tracing::info!("TUN stopping due to stop flag");
+                break;
+            }
+            match tokio::time::timeout(READ_POLL_TIMEOUT, device.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
+                    if n == 0 {
+                        break;
+                    }
+                    let data = buf[..n].to_vec();
+                    let device = device.clone();
+                    let connections = self.connections.clone();
+                    let endpoint_group = self.endpoint_group.clone();
+                    let ip_mapping = self.ip_mapping.clone();
+                    let identification = self.identification.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_packet(
+                            &data,
+                            &device,
+                            &connections,
+                            &endpoint_group,
+                            &ip_mapping,
+                            &identification,
+                        )
+                        .await
+                        {
+                            tracing::debug!("Packet handling error: {}", e);
+                        }
+                    });
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("TUN receive error: {}", e);
+                    break;
+                }
+                Err(_) => continue, // 超时，回到循环检查 stop 标志
+            }
         }
+        tracing::info!("TUN proxy stopped");
         Ok(())
     }
 }
 
 async fn handle_packet(
     data: &[u8],
-    session: &Arc<wintun::Session>,
+    device: &Arc<tun::AsyncDevice>,
     connections: &Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
     endpoint_group: &Arc<EndpointGroup>,
     ip_mapping: &Arc<IpMapping>,
     identification: &Arc<Mutex<u16>>,
 ) -> Result<()> {
-    let ip_packet = match Ipv4Packet::parse(data) { Some(p) => p, None => return Ok(()) };
-    if ip_packet.protocol != IPPROTO_TCP { return Ok(()); }
-    let tcp_packet = match TcpPacket::parse(&ip_packet.payload) { Some(p) => p, None => return Ok(()) };
-    let domain = match ip_mapping.lookup_domain(&ip_packet.dst_addr) { Some(d) => d, None => return Ok(()) };
+    let ip_packet = match Ipv4Packet::parse(data) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if ip_packet.protocol != IPPROTO_TCP {
+        return Ok(());
+    }
+    let tcp_packet = match TcpPacket::parse(&ip_packet.payload) {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let domain = match ip_mapping.lookup_domain(&ip_packet.dst_addr) {
+        Some(d) => d,
+        None => return Ok(()),
+    };
     let conn_key = ConnectionKey {
         src_ip: u32::from(ip_packet.src_addr),
         src_port: tcp_packet.src_port,
         dst_ip: u32::from(ip_packet.dst_addr),
         dst_port: tcp_packet.dst_port,
     };
-    handle_tcp(&conn_key, &tcp_packet, &ip_packet, &domain, session, connections, endpoint_group, identification).await
+    handle_tcp(
+        &conn_key,
+        &tcp_packet,
+        &ip_packet,
+        &domain,
+        device,
+        connections,
+        endpoint_group,
+        identification,
+    )
+    .await
 }
 
 async fn handle_tcp(
@@ -202,7 +322,7 @@ async fn handle_tcp(
     tcp: &TcpPacket,
     ip: &Ipv4Packet,
     domain: &str,
-    session: &Arc<wintun::Session>,
+    device: &Arc<tun::AsyncDevice>,
     connections: &Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
     endpoint_group: &Arc<EndpointGroup>,
     identification: &Arc<Mutex<u16>>,
@@ -219,23 +339,40 @@ async fn handle_tcp(
     }
 
     if is_syn && !is_ack {
-        return handle_syn(conn_key, tcp, ip, domain, session, connections, endpoint_group, identification).await;
+        return handle_syn(
+            conn_key,
+            tcp,
+            ip,
+            domain,
+            device,
+            connections,
+            endpoint_group,
+            identification,
+        )
+        .await;
     }
 
     let conn_exists = connections.lock().contains_key(conn_key);
-    if !conn_exists { return Ok(()); }
+    if !conn_exists {
+        return Ok(());
+    }
 
     let conn_state = {
         let conns = connections.lock();
         conns.get(conn_key).map(|c| (c.state, c.our_seq, c.our_ack))
     };
-    let (state, our_seq, _our_ack) = match conn_state { Some(s) => s, None => return Ok(()) };
+    let (state, our_seq, _our_ack) = match conn_state {
+        Some(s) => s,
+        None => return Ok(()),
+    };
 
     match state {
         TcpState::SynReceived => {
             if is_ack && !has_data {
                 let mut conns = connections.lock();
-                if let Some(conn) = conns.get_mut(conn_key) { conn.state = TcpState::Established; }
+                if let Some(conn) = conns.get_mut(conn_key) {
+                    conn.state = TcpState::Established;
+                }
             }
         }
         TcpState::Established => {
@@ -252,41 +389,69 @@ async fn handle_tcp(
                 }
                 {
                     let mut conns = connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) { conn.nexapipe_send = send_stream; }
+                    if let Some(conn) = conns.get_mut(conn_key) {
+                        conn.nexapipe_send = send_stream;
+                    }
                 }
                 let new_ack = tcp.seq_num.wrapping_add(tcp.payload.len() as u32);
                 let ack_packet = TcpPacket {
-                    src_port: tcp.dst_port, dst_port: tcp.src_port,
-                    seq_num: our_seq, ack_num: new_ack,
-                    flags: tcp_flags::ACK, window: 65535, payload: Vec::new(),
+                    src_port: tcp.dst_port,
+                    dst_port: tcp.src_port,
+                    seq_num: our_seq,
+                    ack_num: new_ack,
+                    flags: tcp_flags::ACK,
+                    window: 65535,
+                    payload: Vec::new(),
                 };
                 let id = get_next_id(identification);
                 let packet = ack_packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-                send_tun_packet(session, &packet)?;
+                send_tun_packet(device, &packet).await?;
                 {
                     let mut conns = connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) { conn.our_ack = new_ack; }
+                    if let Some(conn) = conns.get_mut(conn_key) {
+                        conn.our_ack = new_ack;
+                    }
                 }
-                spawn_recv_task(conn_key.clone(), connections.clone(), ip.dst_addr, ip.src_addr, tcp.dst_port, tcp.src_port, identification.clone(), session.clone(), our_seq, new_ack);
+                spawn_recv_task(
+                    conn_key.clone(),
+                    connections.clone(),
+                    ip.dst_addr,
+                    ip.src_addr,
+                    tcp.dst_port,
+                    tcp.src_port,
+                    identification.clone(),
+                    device.clone(),
+                    our_seq,
+                    new_ack,
+                );
             }
             if is_fin {
                 let fin_ack = tcp.seq_num.wrapping_add(tcp.payload.len() as u32 + 1);
                 let packet = TcpPacket {
-                    src_port: tcp.dst_port, dst_port: tcp.src_port,
-                    seq_num: our_seq, ack_num: fin_ack,
-                    flags: tcp_flags::FIN | tcp_flags::ACK, window: 65535, payload: Vec::new(),
+                    src_port: tcp.dst_port,
+                    dst_port: tcp.src_port,
+                    seq_num: our_seq,
+                    ack_num: fin_ack,
+                    flags: tcp_flags::FIN | tcp_flags::ACK,
+                    window: 65535,
+                    payload: Vec::new(),
                 };
                 let id = get_next_id(identification);
                 let data = packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-                send_tun_packet(session, &data)?;
+                send_tun_packet(device, &data).await?;
                 {
                     let mut conns = connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) { conn.state = TcpState::LastAck; conn.our_ack = fin_ack; }
+                    if let Some(conn) = conns.get_mut(conn_key) {
+                        conn.state = TcpState::LastAck;
+                        conn.our_ack = fin_ack;
+                    }
                 }
             }
         }
         TcpState::LastAck => {
-            if is_ack { connections.lock().remove(conn_key); }
+            if is_ack {
+                connections.lock().remove(conn_key);
+            }
         }
         _ => {}
     }
@@ -298,7 +463,7 @@ async fn handle_syn(
     tcp: &TcpPacket,
     ip: &Ipv4Packet,
     domain: &str,
-    session: &Arc<wintun::Session>,
+    device: &Arc<tun::AsyncDevice>,
     connections: &Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
     endpoint_group: &Arc<EndpointGroup>,
     identification: &Arc<Mutex<u16>>,
@@ -308,12 +473,17 @@ async fn handle_syn(
         Err(e) => {
             tracing::error!("Failed to get nexapipe connection: {}", e);
             let rst_packet = TcpPacket {
-                src_port: tcp.dst_port, dst_port: tcp.src_port, seq_num: 0,
-                ack_num: tcp.seq_num.wrapping_add(1), flags: tcp_flags::RST | tcp_flags::ACK, window: 0, payload: Vec::new(),
+                src_port: tcp.dst_port,
+                dst_port: tcp.src_port,
+                seq_num: 0,
+                ack_num: tcp.seq_num.wrapping_add(1),
+                flags: tcp_flags::RST | tcp_flags::ACK,
+                window: 0,
+                payload: Vec::new(),
             };
             let id = get_next_id(identification);
             let data = rst_packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-            let _ = send_tun_packet(session, &data);
+            let _ = send_tun_packet(device, &data).await;
             return Ok(());
         }
     };
@@ -325,17 +495,25 @@ async fn handle_syn(
         Err(e) => {
             tracing::error!("Failed to open nexapipe stream: {}", e);
             let rst_packet = TcpPacket {
-                src_port: tcp.dst_port, dst_port: tcp.src_port, seq_num: 0,
-                ack_num: tcp.seq_num.wrapping_add(1), flags: tcp_flags::RST | tcp_flags::ACK, window: 0, payload: Vec::new(),
+                src_port: tcp.dst_port,
+                dst_port: tcp.src_port,
+                seq_num: 0,
+                ack_num: tcp.seq_num.wrapping_add(1),
+                flags: tcp_flags::RST | tcp_flags::ACK,
+                window: 0,
+                payload: Vec::new(),
             };
             let id = get_next_id(identification);
             let data = rst_packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-            let _ = send_tun_packet(session, &data);
+            let _ = send_tun_packet(device, &data).await;
             return Ok(());
         }
     };
 
-    let connect_request = format!("CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n", domain, tcp.dst_port, domain, tcp.dst_port);
+    let connect_request = format!(
+        "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+        domain, tcp.dst_port, domain, tcp.dst_port
+    );
     if let Err(e) = send.write_all(connect_request.as_bytes()).await {
         tracing::error!("Failed to send CONNECT request: {}", e);
         return Ok(());
@@ -344,13 +522,17 @@ async fn handle_syn(
     let our_seq = 1000u32;
     let our_ack = tcp.seq_num.wrapping_add(1);
     let syn_ack = TcpPacket {
-        src_port: tcp.dst_port, dst_port: tcp.src_port,
-        seq_num: our_seq, ack_num: our_ack,
-        flags: tcp_flags::SYN | tcp_flags::ACK, window: 65535, payload: Vec::new(),
+        src_port: tcp.dst_port,
+        dst_port: tcp.src_port,
+        seq_num: our_seq,
+        ack_num: our_ack,
+        flags: tcp_flags::SYN | tcp_flags::ACK,
+        window: 65535,
+        payload: Vec::new(),
     };
     let id = get_next_id(identification);
     let data = syn_ack.build_with_ip(ip.dst_addr, ip.src_addr, id);
-    send_tun_packet(session, &data)?;
+    send_tun_packet(device, &data).await?;
 
     let conn_data = Connection {
         state: TcpState::SynReceived,
@@ -371,7 +553,7 @@ fn spawn_recv_task(
     tun_port: u16,
     client_port: u16,
     identification: Arc<Mutex<u16>>,
-    session: Arc<wintun::Session>,
+    device: Arc<tun::AsyncDevice>,
     initial_seq: u32,
     initial_ack: u32,
 ) {
@@ -382,49 +564,62 @@ fn spawn_recv_task(
             None => return,
         }
     };
-    if recv.is_none() { return; }
+    if recv.is_none() {
+        return;
+    }
     let mut recv = recv.unwrap();
     let mut our_seq = initial_seq;
 
     tokio::spawn(async move {
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; 8192];
         loop {
             match recv.read(&mut buf).await {
                 Ok(None) => break,
                 Ok(Some(n)) => {
                     let data = &buf[..n];
                     let tcp_packet = TcpPacket {
-                        src_port: tun_port, dst_port: client_port,
-                        seq_num: our_seq, ack_num: initial_ack,
-                        flags: tcp_flags::PSH | tcp_flags::ACK, window: 65535, payload: data.to_vec(),
+                        src_port: tun_port,
+                        dst_port: client_port,
+                        seq_num: our_seq,
+                        ack_num: initial_ack,
+                        flags: tcp_flags::PSH | tcp_flags::ACK,
+                        window: 65535,
+                        payload: data.to_vec(),
                     };
                     let id = get_next_id(&identification);
                     let packet = tcp_packet.build_with_ip(tun_ip, client_ip, id);
-                    if let Err(_e) = send_tun_packet(&session, &packet) { break; }
+                    if let Err(_e) = send_tun_packet(&device, &packet).await {
+                        break;
+                    }
                     our_seq = our_seq.wrapping_add(n as u32);
                 }
                 Err(_e) => break,
             }
         }
         let fin_packet = TcpPacket {
-            src_port: tun_port, dst_port: client_port,
-            seq_num: our_seq, ack_num: initial_ack,
-            flags: tcp_flags::FIN | tcp_flags::ACK, window: 65535, payload: Vec::new(),
+            src_port: tun_port,
+            dst_port: client_port,
+            seq_num: our_seq,
+            ack_num: initial_ack,
+            flags: tcp_flags::FIN | tcp_flags::ACK,
+            window: 65535,
+            payload: Vec::new(),
         };
         let id = get_next_id(&identification);
         let packet = fin_packet.build_with_ip(tun_ip, client_ip, id);
-        let _ = send_tun_packet(&session, &packet);
+        let _ = send_tun_packet(&device, &packet).await;
         let mut conns = connections.lock();
-        if let Some(conn) = conns.get_mut(&conn_key) { conn.state = TcpState::FinWait1; }
+        if let Some(conn) = conns.get_mut(&conn_key) {
+            conn.state = TcpState::FinWait1;
+        }
     });
 }
 
-#[cfg(windows)]
-fn send_tun_packet(session: &Arc<wintun::Session>, data: &[u8]) -> Result<()> {
-    let mut packet = session.allocate_send_packet(data.len() as u16)
-        .map_err(|e| anyhow::anyhow!("Failed to allocate TUN packet: {:?}", e))?;
-    packet.bytes_mut().copy_from_slice(data);
-    session.send_packet(packet);
+async fn send_tun_packet(device: &Arc<tun::AsyncDevice>, data: &[u8]) -> Result<()> {
+    device
+        .send(data)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to send TUN packet: {}", e))?;
     Ok(())
 }
 
@@ -433,4 +628,70 @@ fn get_next_id(identification: &Arc<Mutex<u16>>) -> u16 {
     let current = *id;
     *id = id.wrapping_add(1);
     current
+}
+
+/// Windows: 定位 wintun.dll 的绝对路径（只查找，不加载）。
+/// 按优先级：编译期注入的 WINTUN_PATH（build.rs 复制到 exe 目录的位置）
+/// → exe 同目录 → exe/wintun/bin/{arch} → 打包资源目录 → 运行时 WINTUN_PATH。
+#[cfg(windows)]
+fn find_wintun_path() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(p) = option_env!("WINTUN_PATH") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        let arch_dir = target_arch_dir();
+        candidates.push(exe_dir.join("wintun.dll"));
+        candidates.push(
+            exe_dir
+                .join("wintun")
+                .join("bin")
+                .join(arch_dir)
+                .join("wintun.dll"),
+        );
+        candidates.push(
+            exe_dir
+                .join("resources")
+                .join("wintun")
+                .join("bin")
+                .join(arch_dir)
+                .join("wintun.dll"),
+        );
+    }
+    if let Ok(path) = std::env::var("WINTUN_PATH") {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.into_iter().find(|p| p.exists())
+}
+
+#[cfg(windows)]
+fn target_arch_dir() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "amd64"
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        "x86"
+    }
+    #[cfg(target_arch = "arm")]
+    {
+        "arm"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "arm64"
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "arm",
+        target_arch = "aarch64"
+    )))]
+    {
+        "amd64"
+    }
 }
