@@ -77,6 +77,7 @@ function handleUpdate() {
     .filter(d => d.length > 0);
   
   emit("update", {
+    ...props.config,
     nodes: localNodes.value.map(n => ({ ...n })),
     domains,
     localAddr: localAddr.value,

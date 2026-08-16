@@ -2,8 +2,12 @@ use crate::proxy::dns::{DnsServerConfig, IpMapping};
 use crate::proxy::local_proxy::{LocalProxyConfig, LocalProxyWrapper};
 use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, TUN_IP};
 use anyhow::Result;
+use iroh::endpoint::presets;
+use iroh::{RelayMap, RelayUrl, Endpoint};
+use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig};
 use nexapipe_client::lb::LoadBalancingStrategy;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -59,6 +63,13 @@ pub struct ProxyManagerConfig {
     pub upstream_dns: String,
     pub load_balancing: ProxyLoadBalancingStrategy,
     pub tun_name: String,
+    pub relay_mode: String,
+    pub relay_url: String,
+    pub force_relay: bool,
+    pub two_factor_enabled: bool,
+    pub two_factor_client_id: String,
+    pub two_factor_secret: String,
+    pub two_factor_algorithm: String,
 }
 
 struct ProxyInstance {
@@ -144,10 +155,66 @@ impl ProxyManager {
             })
             .collect();
 
+        // Build iroh endpoint with relay configuration
+        let mut ep_builder = Endpoint::builder(presets::N0);
+        match self.config.relay_mode.as_str() {
+            "disabled" => {
+                tracing::info!("Relay mode: disabled (direct connections only)");
+                ep_builder = ep_builder.relay_mode(iroh::RelayMode::Disabled);
+            }
+            "default" => {
+                tracing::info!("Relay mode: default (all N0 relays)");
+            }
+            "custom" => {
+                if !self.config.relay_url.is_empty() {
+                    tracing::info!("Relay mode: custom, url={}", self.config.relay_url);
+                    let relay_url = RelayUrl::from_str(&self.config.relay_url)
+                        .map_err(|e| anyhow::anyhow!("Invalid relay URL: {}", e))?;
+                    ep_builder = ep_builder.relay_mode(
+                        iroh::RelayMode::Custom(RelayMap::from_iter(vec![relay_url])),
+                    );
+                } else {
+                    tracing::warn!("Relay mode is custom but no URL provided, using pinned default");
+                }
+            }
+            "pinned" | _ => {
+                // 默认行为：固定 relay 到 aps1-1（亚太南），防止 relay 切换导致 WS 断线。
+                let pinned_url = "https://aps1-1.relay.n0.iroh.link.";
+                let relay_url = RelayUrl::from_str(pinned_url)
+                    .expect("PINNED_RELAY_URL must be a valid relay URL");
+                tracing::info!("Relay mode: pinned to {}", pinned_url);
+                ep_builder = ep_builder.relay_mode(
+                    iroh::RelayMode::Custom(RelayMap::from_iter(vec![relay_url])),
+                );
+            }
+        }
+
+        let iroh_endpoint = ep_builder.bind().await
+            .map_err(|e| anyhow::anyhow!("Failed to bind iroh endpoint: {}", e))?;
+        tracing::info!("Iroh endpoint bound, node_id={}", iroh_endpoint.id());
+        if self.config.force_relay {
+            tracing::info!("Force relay enabled: direct connections will be disabled");
+        }
+
         let endpoint_group =
-            EndpointGroup::new_with_nodes(nodes.clone(), None, self.config.load_balancing.into())
+            EndpointGroup::new_with_nodes_and_endpoint(nodes.clone(), None, self.config.load_balancing.into(), iroh_endpoint)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
+
+        // 2FA：若启用且配置了 secret，则每个新建连接会先执行认证握手。
+        if self.config.two_factor_enabled && !self.config.two_factor_secret.trim().is_empty() {
+            let auth = TwoFactorAuth::new(
+                &self.config.two_factor_client_id,
+                &self.config.two_factor_secret,
+                TotpAlgorithm::from_name(&self.config.two_factor_algorithm),
+            )
+            .map_err(|e| anyhow::anyhow!("Invalid 2FA config: {}", e))?;
+            endpoint_group.set_two_factor(Some(auth)).await;
+            tracing::info!(
+                "2FA enabled, client_id: {}",
+                self.config.two_factor_client_id
+            );
+        }
 
         let endpoint_group = Arc::new(endpoint_group);
 

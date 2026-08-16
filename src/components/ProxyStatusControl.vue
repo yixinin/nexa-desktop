@@ -144,7 +144,14 @@ async function startProxy() {
       loadBalancing: props.config.loadBalancing,
       tunName: props.config.tunName,
       useService: props.config.useService,
-    });
+        relayMode: props.config.relayMode,
+        relayUrl: props.config.relayUrl,
+        forceRelay: props.config.forceRelay,
+        twoFactorEnabled: props.config.twoFactorEnabled,
+        twoFactorClientId: props.config.twoFactorClientId,
+        twoFactorSecret: props.config.twoFactorSecret,
+        twoFactorAlgorithm: props.config.twoFactorAlgorithm,
+      });
     
     await new Promise(resolve => setTimeout(resolve, 1000));
     await updateStatus();

@@ -128,7 +128,186 @@ loadSettings();
       </div>
     </div>
 
+    
     <div class="settings-section">
+      <div class="card-header">
+        <h2>Relay 设置</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">Relay 模式</span>
+              <span class="setting-hint">配置 iroh relay 转发模式</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <select
+              v-model="config.relayMode"
+              class="select-input"
+              @change="updateConfig({ relayMode: config.relayMode })"
+            >
+              <option value="pinned">固定 (aps1-1，稳定)</option>
+              <option value="default">默认 (所有 N0 relay)</option>
+              <option value="disabled">禁用 (仅直连)</option>
+              <option value="custom">自定义 URL</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting-item" v-if="config.relayMode === 'custom'">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+              <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">Relay URL</span>
+              <span class="setting-hint">自定义 relay 服务器地址</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <input
+              v-model="config.relayUrl"
+              class="text-input"
+              placeholder="https://relay.example.com"
+              @change="updateConfig({ relayUrl: config.relayUrl.trim() })"
+            />
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">强制 Relay</span>
+              <span class="setting-hint">始终通过 relay 服务器转发连接（禁用直连）</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <button
+              class="toggle"
+              :class="{ active: config.forceRelay }"
+              @click="updateConfig({ forceRelay: !config.forceRelay })"
+            >
+              <div class="toggle-thumb"></div>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="card-header">
+        <h2>2FA 认证</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2"/>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">启用 2FA 认证</span>
+              <span class="setting-hint">连接服务器时执行 TOTP 两步验证</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <button
+              class="toggle"
+              :class="{ active: config.twoFactorEnabled }"
+              @click="updateConfig({ twoFactorEnabled: !config.twoFactorEnabled })"
+            >
+              <div class="toggle-thumb"></div>
+            </button>
+          </div>
+        </div>
+
+        <template v-if="config.twoFactorEnabled">
+          <div class="setting-item">
+            <div class="setting-left">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="8" r="4"/>
+                <path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>
+              </svg>
+              <div class="setting-info">
+                <span class="setting-label">客户端 ID</span>
+                <span class="setting-hint">与服务器 [auth.clients] 中配置的 ID 一致</span>
+              </div>
+            </div>
+            <div class="setting-right">
+              <input
+                v-model="config.twoFactorClientId"
+                class="text-input"
+                placeholder="client-001"
+                @change="updateConfig({ twoFactorClientId: config.twoFactorClientId.trim() })"
+              />
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-left">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="11" width="18" height="11" rx="2"/>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+              </svg>
+              <div class="setting-info">
+                <span class="setting-label">TOTP Secret</span>
+                <span class="setting-hint">Base32 密钥，用 nexapipe --generate-2fa 生成</span>
+              </div>
+            </div>
+            <div class="setting-right">
+              <input
+                v-model="config.twoFactorSecret"
+                class="text-input"
+                type="password"
+                placeholder="JBSWY3DPEHPK3PXP"
+                @change="updateConfig({ twoFactorSecret: config.twoFactorSecret.trim() })"
+              />
+            </div>
+          </div>
+
+          <div class="setting-item">
+            <div class="setting-left">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="2" y1="12" x2="22" y2="12"/>
+                <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+              </svg>
+              <div class="setting-info">
+                <span class="setting-label">算法</span>
+                <span class="setting-hint">与服务器 [auth] 中 algorithm 一致</span>
+              </div>
+            </div>
+            <div class="setting-right">
+              <select
+                v-model="config.twoFactorAlgorithm"
+                class="select-input"
+                @change="updateConfig({ twoFactorAlgorithm: config.twoFactorAlgorithm })"
+              >
+                <option value="sha1">SHA1（默认）</option>
+                <option value="sha256">SHA256</option>
+                <option value="sha512">SHA512</option>
+              </select>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+<div class="settings-section">
       <div class="card-header">
         <h2>应用设置</h2>
         <div class="card-header-decoration"></div>

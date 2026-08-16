@@ -48,6 +48,13 @@ impl IpcClient {
         upstream_dns: Option<String>,
         load_balancing: Option<String>,
         tun_name: Option<String>,
+        relay_mode: Option<String>,
+        relay_url: Option<String>,
+        force_relay: Option<bool>,
+        two_factor_enabled: Option<bool>,
+        two_factor_client_id: Option<String>,
+        two_factor_secret: Option<String>,
+        two_factor_algorithm: Option<String>,
     ) -> Result<String> {
         let response = Self::send_message(IpcMessage::StartProxy(StartProxyRequest {
             nodes,
@@ -57,6 +64,13 @@ impl IpcClient {
             upstream_dns,
             load_balancing,
             tun_name,
+            relay_mode,
+            relay_url,
+            force_relay,
+            two_factor_enabled,
+            two_factor_client_id,
+            two_factor_secret,
+            two_factor_algorithm,
         }))
         .await?;
 

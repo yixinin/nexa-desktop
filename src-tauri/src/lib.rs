@@ -63,6 +63,13 @@ async fn start_proxy(
     load_balancing: Option<String>,
     tun_name: Option<String>,
     use_service: Option<bool>,
+    relay_mode: Option<String>,
+    relay_url: Option<String>,
+    force_relay: Option<bool>,
+    two_factor_enabled: Option<bool>,
+    two_factor_client_id: Option<String>,
+    two_factor_secret: Option<String>,
+    two_factor_algorithm: Option<String>,
 ) -> Result<String, String> {
     let use_service = use_service.unwrap_or(false);
 
@@ -75,6 +82,13 @@ async fn start_proxy(
             upstream_dns.clone(),
             load_balancing.clone(),
             tun_name.clone(),
+            relay_mode.clone(),
+            relay_url.clone(),
+            force_relay,
+            two_factor_enabled,
+            two_factor_client_id.clone(),
+            two_factor_secret.clone(),
+            two_factor_algorithm.clone(),
         )
         .await
         {
@@ -125,6 +139,13 @@ async fn start_proxy(
         upstream_dns,
         load_balancing,
         tun_name,
+        relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
+        relay_url: relay_url.unwrap_or_default(),
+        force_relay: force_relay.unwrap_or(false),
+        two_factor_enabled: two_factor_enabled.unwrap_or(false),
+        two_factor_client_id: two_factor_client_id.unwrap_or_default(),
+        two_factor_secret: two_factor_secret.unwrap_or_default(),
+        two_factor_algorithm: two_factor_algorithm.unwrap_or_else(|| "sha1".to_string()),
     };
 
     let manager = Arc::new(ProxyManager::new(config));

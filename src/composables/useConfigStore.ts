@@ -17,6 +17,13 @@ const defaultConfig: ProxyConfig = {
   loadBalancing: "round_robin",
   tunName: "pipe-tun",
   useService: false,
+  relayMode: 'pinned' as const,
+  relayUrl: '',
+  forceRelay: false,
+  twoFactorEnabled: false,
+  twoFactorClientId: '',
+  twoFactorSecret: '',
+  twoFactorAlgorithm: 'sha1' as const,
 };
 
 function migrateOldConfig(old: any): ProxyConfig {
@@ -55,6 +62,13 @@ function migrateOldConfig(old: any): ProxyConfig {
   if (old.loadBalancing) {
     config.loadBalancing = old.loadBalancing;
   }
+  if (old.relayMode) { config.relayMode = old.relayMode; }
+  if (old.relayUrl !== undefined) { config.relayUrl = old.relayUrl; }
+  if (old.forceRelay !== undefined) { config.forceRelay = old.forceRelay; }
+  if (old.twoFactorEnabled !== undefined) { config.twoFactorEnabled = old.twoFactorEnabled; }
+  if (old.twoFactorClientId !== undefined) { config.twoFactorClientId = old.twoFactorClientId; }
+  if (old.twoFactorSecret !== undefined) { config.twoFactorSecret = old.twoFactorSecret; }
+  if (old.twoFactorAlgorithm !== undefined) { config.twoFactorAlgorithm = old.twoFactorAlgorithm; }
 
   return config;
 }
