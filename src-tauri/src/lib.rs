@@ -4,6 +4,7 @@ pub mod service;
 pub mod status;
 
 use error::{codes, AppError};
+use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
     StartError,
@@ -12,6 +13,7 @@ use service::ipc::NodeInput;
 use service::platform::ServiceState;
 use service::IpcClient;
 use status::{EndpointLink, ProxyStatus};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -78,11 +80,7 @@ async fn start_proxy(
     use_tun: Option<bool>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
-    force_relay: Option<bool>,
-    two_factor_enabled: Option<bool>,
-    two_factor_client_id: Option<String>,
-    two_factor_secret: Option<String>,
-    two_factor_algorithm: Option<String>,
+    relay_auth_token: Option<String>,
 ) -> Result<(), AppError> {
     let use_service = use_service.unwrap_or(false);
     let use_tun = use_tun.unwrap_or(false);
@@ -106,11 +104,7 @@ async fn start_proxy(
             use_tun,
             relay_mode.clone(),
             relay_url.clone(),
-            force_relay,
-            two_factor_enabled,
-            two_factor_client_id.clone(),
-            two_factor_secret.clone(),
-            two_factor_algorithm.clone(),
+            relay_auth_token.clone(),
         )
         .await
         {
@@ -145,6 +139,8 @@ async fn start_proxy(
         .into_iter()
         .filter(|n| !n.ticket.is_empty() || !n.endpoint_id.is_empty())
         .map(|n| {
+            // Read before the connection string is moved out of `n`.
+            let two_factor = n.two_factor();
             let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
                 ConnectionConfig::Ticket(n.ticket)
             } else {
@@ -160,6 +156,7 @@ async fn start_proxy(
             ProxyNodeConfig {
                 connection,
                 domains: merged,
+                two_factor,
             }
         })
         .collect();
@@ -189,11 +186,7 @@ async fn start_proxy(
         use_tun,
         relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
         relay_url: relay_url.unwrap_or_default(),
-        force_relay: force_relay.unwrap_or(false),
-        two_factor_enabled: two_factor_enabled.unwrap_or(false),
-        two_factor_client_id: two_factor_client_id.unwrap_or_default(),
-        two_factor_secret: two_factor_secret.unwrap_or_default(),
-        two_factor_algorithm: two_factor_algorithm.unwrap_or_else(|| "sha1".to_string()),
+        relay_auth_token: relay_auth_token.unwrap_or_default(),
     };
 
     let manager = Arc::new(ProxyManager::new(config));
@@ -342,6 +335,78 @@ async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLin
     Ok(match proxy_manager.as_ref() {
         Some(manager) => manager.endpoint_links().await,
         None => Vec::new(),
+    })
+}
+
+/// A `nexapipe://` invitation read into the shape the UI needs to fill in a node.
+///
+/// The grammar lives in `nexapipe-client` (module `provisioning`), the same parser the server that
+/// prints the code and the Android client that scans it both read; the desktop asks it instead of
+/// growing a third implementation that would drift. Only what the UI has to *show* before the
+/// user commits is carried across, and nothing is applied here: an invite is described, then the
+/// frontend decides.
+///
+/// The fields cross into TypeScript, where `InvitePayload` in `src/types/index.ts` spells them
+/// camelCase. Nothing in Tauri rewrites the keys of a command result — every struct has to ask
+/// for the conversion itself — so without this rename the frontend reads `undefined` for every
+/// multi-word field while the single-word ones arrive intact, which is how a parsed invite lost
+/// its client id and kept its secret.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvitePayload {
+    /// `endpoint` for a bare Node ID, `ticket` for an address-bearing ticket.
+    pub kind: String,
+    /// The Node ID, or the ticket, verbatim.
+    pub target: String,
+    /// Cosmetic label from the invite. Nothing routes on it.
+    pub name: Option<String>,
+    pub domains: Vec<String>,
+    pub relay: Option<String>,
+    pub totp: Option<InviteTotpPayload>,
+}
+
+/// The 2FA half of an invite, in the form the config store keeps it.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteTotpPayload {
+    pub client_id: String,
+    pub secret: String,
+    /// Lowercase algorithm name, which is what `twoFactorAlgorithm` holds.
+    pub algorithm: String,
+    pub issuer: String,
+}
+
+/// Reads a `nexapipe://` invite pasted into the UI.
+///
+/// Pure parsing: no proxy is touched and no config is written, so the UI can show what a code
+/// carries before the user accepts it. A rejected code comes back as `invite.parse_failed` with
+/// the parser's reason as `detail` — the reason names the offending part ("unsupported version",
+/// "unknown host"), which is worth more than a generic failure but is still an English diagnostic.
+///
+/// Not `async`: it is a string parse with no I/O, and a synchronous command keeps it off the
+/// async runtime entirely.
+#[tauri::command]
+fn parse_invite(uri: String) -> Result<InvitePayload, AppError> {
+    let invite = EndpointInvite::from_uri(&uri)
+        .map_err(|e| AppError::cause(codes::INVITE_PARSE_FAILED, e))?;
+
+    let (kind, target) = match &invite.target {
+        EndpointTarget::NodeId(id) => ("endpoint".to_string(), id.clone()),
+        EndpointTarget::Ticket(ticket) => ("ticket".to_string(), ticket.clone()),
+    };
+
+    Ok(InvitePayload {
+        kind,
+        target,
+        name: invite.name.clone(),
+        domains: invite.domains.clone(),
+        relay: invite.relay.clone(),
+        totp: invite.totp.as_ref().map(|totp| InviteTotpPayload {
+            client_id: totp.client_id.clone(),
+            secret: totp.secret.clone(),
+            algorithm: totp.algorithm.name().to_string(),
+            issuer: totp.issuer.clone(),
+        }),
     })
 }
 
@@ -497,6 +562,7 @@ pub fn run() {
             get_proxy_status,
             get_node_id,
             get_endpoint_links,
+            parse_invite,
             install_service,
             uninstall_service,
             start_service,
@@ -508,4 +574,95 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexapipe_client::provisioning::InviteTotp;
+
+    /// A Node ID nobody is listening on, derived from a fixed seed so the expected strings in
+    /// these tests stay stable — parsing checks that the point is valid, not just that it is
+    /// 64 hex characters.
+    fn node_id() -> String {
+        iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string()
+    }
+
+    fn endpoint_invite() -> EndpointInvite {
+        EndpointInvite::new(
+            EndpointTarget::NodeId(node_id()),
+            &["a.example".to_string(), "b.example".to_string()],
+        )
+        .expect("the sample invite is well formed")
+    }
+
+    #[test]
+    fn reads_a_node_id_invite() {
+        let payload = parse_invite(endpoint_invite().with_name("Home").to_uri()).unwrap();
+
+        assert_eq!(payload.kind, "endpoint");
+        assert_eq!(payload.target, node_id());
+        assert_eq!(payload.name.as_deref(), Some("Home"));
+        assert_eq!(payload.domains, vec!["a.example", "b.example"]);
+        assert_eq!(payload.relay, None);
+        assert!(payload.totp.is_none());
+    }
+
+    #[test]
+    fn reads_a_ticket_invite() {
+        let target = EndpointTarget::Ticket(
+            iroh_tickets::endpoint::EndpointTicket::new(
+                node_id()
+                    .parse::<iroh::EndpointId>()
+                    .expect("the sample node ID is well formed")
+                    .into(),
+            )
+            .to_string(),
+        );
+        let invite =
+            EndpointInvite::new(target.clone(), &[]).expect("the sample invite is well formed");
+
+        let payload = parse_invite(invite.to_uri()).unwrap();
+        assert_eq!(payload.kind, "ticket");
+        assert_eq!(payload.target, target.to_string());
+        assert!(payload.domains.is_empty());
+    }
+
+    #[test]
+    fn reads_the_2fa_half() {
+        let invite = endpoint_invite().with_totp(Some(
+            InviteTotp::new("client-001", "jbswy3dpehpk3pxp").expect("the secret is valid base32"),
+        ));
+
+        let payload = parse_invite(invite.to_uri()).unwrap();
+        let totp = payload.totp.expect("the invite carries 2FA");
+        assert_eq!(totp.client_id, "client-001");
+        assert_eq!(totp.secret, "JBSWY3DPEHPK3PXP");
+        assert_eq!(totp.algorithm, "sha1");
+    }
+
+    /// The frontend reads `invite.totp.clientId`, and only the multi-word key was ever at risk:
+    /// `secret` and `algorithm` have no casing to disagree about, so a missing rename did not fail
+    /// a parse — it produced a node with a secret and no client id, which every server then
+    /// refuses. Pin the keys the UI actually sees.
+    #[test]
+    fn hands_the_2fa_half_to_the_frontend_in_camel_case() {
+        let invite = endpoint_invite().with_totp(Some(
+            InviteTotp::new("client-001", "jbswy3dpehpk3pxp").expect("the secret is valid base32"),
+        ));
+
+        let payload = parse_invite(invite.to_uri()).unwrap();
+        let json: serde_json::Value = serde_json::to_value(&payload).unwrap();
+        let totp = json["totp"].as_object().expect("the 2FA block travels whole");
+        assert_eq!(totp["clientId"], "client-001");
+        assert!(totp.get("client_id").is_none(), "keys must reach the UI as camelCase");
+    }
+
+    #[test]
+    fn reports_a_code_and_a_reason_when_the_link_is_not_an_invite() {
+        let error = parse_invite("https://example.com".to_string()).unwrap_err();
+
+        assert_eq!(error.code, codes::INVITE_PARSE_FAILED);
+        assert!(error.detail.is_some(), "the parser's reason travels as detail");
+    }
 }

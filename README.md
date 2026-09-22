@@ -25,7 +25,9 @@ its own history: <https://github.com/open-nexa/nexa-desktop>.
 - Multi-node configuration: several server nodes, each owning a set of domains;
   `round_robin` or `random` load balancing. The same domain on several nodes is
   load balanced automatically.
-- Relay control (`default` / `custom` URL / `disabled`) and "force relay".
+- Relay control: `pinned` (default), `default`, `custom` URL (with an optional
+  auth token), or `disabled`. No "force relay" switch — iroh 1.0.1 offers no way
+  to make it true.
 - TOTP 2FA credentials (client id, secret, algorithm).
 - Live status, in-app log viewer, service install/uninstall.
 - Bilingual UI (English + 简体中文), light/dark theme, self-updater.

@@ -7,6 +7,6 @@ pub mod routing;
 pub mod tun_proxy;
 
 pub use manager::{
-    ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
-    StartError,
+    ConnectionConfig, NodeTwoFactor, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig,
+    ProxyNodeConfig, StartError,
 };

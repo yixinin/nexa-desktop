@@ -3,16 +3,16 @@ use crate::proxy::local_proxy::LocalProxyWrapper;
 use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, TUN_IP};
 use anyhow::Result;
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointId, RelayMap, RelayUrl};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
 use nexapipe_client::connection_pool::parse_endpoint_addr;
 use nexapipe_client::endpoint_group::{EndpointGroup, NodeConfig};
 use nexapipe_client::lb::LoadBalancingStrategy;
+use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::transport::TransportTuning;
 use nexapipe_client::LinkKind;
 use std::collections::HashMap;
 use std::fmt;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::status::EndpointLink;
@@ -102,6 +102,31 @@ pub enum ConnectionConfig {
 pub struct ProxyNodeConfig {
     pub connection: ConnectionConfig,
     pub domains: Vec<String>,
+    /// 2FA credentials for *this* endpoint, not for every endpoint: each server keeps its own
+    /// `[auth].clients` entry, so a single shared pair is what forced a second server to be
+    /// given the first one's secret. `None` performs no handshake at all, which is also what
+    /// lets one client mix servers that require 2FA with ones that do not.
+    pub two_factor: Option<NodeTwoFactor>,
+}
+
+/// The 2FA credentials one node is configured with.
+#[derive(Debug, Clone)]
+pub struct NodeTwoFactor {
+    pub client_id: String,
+    pub secret: String,
+    /// Lowercase algorithm name, as `TotpAlgorithm::from_name` expects it.
+    pub algorithm: String,
+}
+
+/// The address a configured node resolves to.
+///
+/// `None` when the string is neither a valid Node ID nor a valid ticket: such a node never got a
+/// pool in the group, so there is nothing to configure or report for it.
+fn backend_addr(connection: &ConnectionConfig) -> Option<EndpointAddr> {
+    match connection {
+        ConnectionConfig::Ticket(ticket) => parse_endpoint_addr(None, Some(ticket)).ok(),
+        ConnectionConfig::EndpointId(id) => parse_endpoint_addr(Some(id), None).ok(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -146,11 +171,9 @@ pub struct ProxyManagerConfig {
     pub use_tun: bool,
     pub relay_mode: String,
     pub relay_url: String,
-    pub force_relay: bool,
-    pub two_factor_enabled: bool,
-    pub two_factor_client_id: String,
-    pub two_factor_secret: String,
-    pub two_factor_algorithm: String,
+    /// Bearer token for a `custom` relay that requires one. Only ever read together with
+    /// `relay_url`, and never logged.
+    pub relay_auth_token: String,
 }
 
 struct ProxyInstance {
@@ -248,68 +271,85 @@ impl ProxyManager {
         // proxied stream in both modes, and without it each stream falls back to iroh's 1.25 MB
         // default receive window, which caps a single connection at roughly 50 Mbps on a 200 ms
         // path. `TransportTuning::from_env()` keeps the A/B overrides working.
+        //
+        // The relay mode comes from the shared resolver in nexapipe-client, so the desktop,
+        // Android and the server cannot drift apart. A mode that is set but unusable is an
+        // error, never a silent substitution — an empty mode (nothing configured) is the only
+        // thing that defers, to "pinned".
         let transport_tuning = TransportTuning::from_env();
         tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
-        let mut ep_builder = Endpoint::builder(presets::N0)
-            .transport_config(transport_tuning.transport_config());
-        match self.config.relay_mode.as_str() {
-            "disabled" => {
-                tracing::info!("Relay mode: disabled (direct connections only)");
-                ep_builder = ep_builder.relay_mode(iroh::RelayMode::Disabled);
-            }
-            "default" => {
-                tracing::info!("Relay mode: default (all N0 relays)");
-            }
-            "custom" => {
-                if !self.config.relay_url.is_empty() {
-                    tracing::info!("Relay mode: custom, url={}", self.config.relay_url);
-                    let relay_url = RelayUrl::from_str(&self.config.relay_url)
-                        .map_err(|e| anyhow::anyhow!("Invalid relay URL: {}", e))?;
-                    ep_builder = ep_builder.relay_mode(
-                        iroh::RelayMode::Custom(RelayMap::from_iter(vec![relay_url])),
-                    );
-                } else {
-                    tracing::warn!("Relay mode is custom but no URL provided, using pinned default");
-                }
-            }
-            "pinned" | _ => {
-                // Default behaviour: pin the relay to aps1-1 (Asia Pacific South) so that a
-                // relay switch cannot drop the WebSocket connection.
-                let pinned_url = "https://aps1-1.relay.n0.iroh.link.";
-                let relay_url = RelayUrl::from_str(pinned_url)
-                    .expect("PINNED_RELAY_URL must be a valid relay URL");
-                tracing::info!("Relay mode: pinned to {}", pinned_url);
-                ep_builder = ep_builder.relay_mode(
-                    iroh::RelayMode::Custom(RelayMap::from_iter(vec![relay_url])),
-                );
-            }
+        let relay = RelayModeSpec::parse(
+            Some(&self.config.relay_mode),
+            Some(&self.config.relay_url),
+            Some(&self.config.relay_auth_token),
+        )
+        .map_err(StartError::Other)?
+        .unwrap_or(RelayModeSpec::Pinned);
+        if !relay.uses_url() && !self.config.relay_url.is_empty() {
+            tracing::warn!(
+                "relay_url {:?} is set but relay_mode {:?} does not use one; ignoring it",
+                self.config.relay_url,
+                self.config.relay_mode
+            );
         }
+        tracing::info!("Relay: {}", relay.describe());
+        let ep_builder = Endpoint::builder(presets::N0)
+            .transport_config(transport_tuning.transport_config())
+            .relay_mode(relay.relay_mode());
 
         let iroh_endpoint = ep_builder.bind().await
             .map_err(|e| anyhow::anyhow!("Failed to bind iroh endpoint: {}", e))?;
         tracing::info!("Iroh endpoint bound, node_id={}", iroh_endpoint.id());
-        if self.config.force_relay {
-            tracing::info!("Force relay enabled: direct connections will be disabled");
-        }
 
         let endpoint_group =
             EndpointGroup::new_with_nodes_and_endpoint(nodes.clone(), None, self.config.load_balancing.into(), iroh_endpoint)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
 
-        // 2FA: when enabled and a secret is configured, every new connection performs the
-        // authentication handshake first.
-        if self.config.two_factor_enabled && !self.config.two_factor_secret.trim().is_empty() {
+        // 2FA is per endpoint, applied after the group exists because that is when each node has
+        // been resolved to the backend ID its pool is keyed by. A node with no credentials keeps
+        // none, so it opens no auth stream.
+        for node in &self.config.nodes {
+            let two_factor = match &node.two_factor {
+                Some(two_factor) => two_factor,
+                None => continue,
+            };
+            if two_factor.secret.trim().is_empty() {
+                continue;
+            }
+
+            let addr = match backend_addr(&node.connection) {
+                Some(addr) => addr,
+                None => {
+                    tracing::warn!(
+                        "2FA configured for a node that is neither a Node ID nor a ticket, ignoring it"
+                    );
+                    continue;
+                }
+            };
+
+            // The server looks a handshake up by client_id (`clients.get(client_id)`),
+            // so a secret with no id can never match any entry there: it authenticates
+            // as client '' and is refused. That is a configuration mistake worth
+            // saying out loud, because the client only ever sees the refusal.
+            if two_factor.client_id.trim().is_empty() {
+                tracing::warn!(
+                    "2FA for {} has a secret but an empty client_id — this node will be rejected by any server keyed by client id",
+                    addr.id
+                );
+            }
+
             let auth = TwoFactorAuth::new(
-                &self.config.two_factor_client_id,
-                &self.config.two_factor_secret,
-                TotpAlgorithm::from_name(&self.config.two_factor_algorithm),
+                &two_factor.client_id,
+                &two_factor.secret,
+                TotpAlgorithm::from_name(&two_factor.algorithm),
             )
-            .map_err(|e| anyhow::anyhow!("Invalid 2FA config: {}", e))?;
-            endpoint_group.set_two_factor(Some(auth)).await;
+            .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?;
+            endpoint_group.set_two_factor_for(&addr.id.to_string(), Some(auth)).await;
             tracing::info!(
-                "2FA enabled, client_id: {}",
-                self.config.two_factor_client_id
+                "2FA enabled for {}, client_id: {}",
+                addr.id,
+                two_factor.client_id
             );
         }
 
@@ -500,17 +540,13 @@ impl ProxyManager {
             .nodes
             .iter()
             .filter_map(|node| {
-                let (connection, addr) = match &node.connection {
-                    ConnectionConfig::Ticket(ticket) => {
-                        (ticket.clone(), parse_endpoint_addr(None, Some(ticket)))
-                    }
-                    ConnectionConfig::EndpointId(id) => {
-                        (id.clone(), parse_endpoint_addr(Some(id), None))
-                    }
+                let connection = match &node.connection {
+                    ConnectionConfig::Ticket(ticket) => ticket.clone(),
+                    ConnectionConfig::EndpointId(id) => id.clone(),
                 };
                 // A node the group could not parse never got a pool, so there is nothing to
                 // report for it; dropping it keeps the list aligned with what actually dialed.
-                let addr = addr.ok()?;
+                let addr = backend_addr(&node.connection)?;
                 Some(EndpointLink {
                     connection,
                     endpoint_id: addr.id.to_string(),

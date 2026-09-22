@@ -160,11 +160,7 @@ impl ServiceRunner {
                         req.use_tun,
                         req.relay_mode,
                         req.relay_url,
-                        req.force_relay,
-                        req.two_factor_enabled,
-                        req.two_factor_client_id,
-                        req.two_factor_secret,
-                        req.two_factor_algorithm,
+                        req.relay_auth_token,
                         &proxy_manager,
                     )
                     .await
@@ -256,11 +252,7 @@ impl ServiceRunner {
         use_tun: Option<bool>,
         relay_mode: Option<String>,
         relay_url: Option<String>,
-        force_relay: Option<bool>,
-        two_factor_enabled: Option<bool>,
-        two_factor_client_id: Option<String>,
-        two_factor_secret: Option<String>,
-        two_factor_algorithm: Option<String>,
+        relay_auth_token: Option<String>,
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
         // Merge the global domains into every node — same logic as process mode (lib.rs) —
@@ -274,6 +266,8 @@ impl ServiceRunner {
             .into_iter()
             .filter(|n| !n.ticket.is_empty() || !n.endpoint_id.is_empty())
             .map(|n| {
+                // Read before the connection string is moved out of `n`.
+                let two_factor = n.two_factor();
                 let connection = if n.connection_type == "ticket" || !n.ticket.is_empty() {
                     ConnectionConfig::Ticket(n.ticket)
                 } else {
@@ -288,6 +282,7 @@ impl ServiceRunner {
                 ProxyNodeConfig {
                     connection,
                     domains: merged,
+                    two_factor,
                 }
             })
             .collect();
@@ -343,11 +338,7 @@ impl ServiceRunner {
             use_tun,
             relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
             relay_url: relay_url.unwrap_or_default(),
-            force_relay: force_relay.unwrap_or(false),
-            two_factor_enabled: two_factor_enabled.unwrap_or(false),
-            two_factor_client_id: two_factor_client_id.unwrap_or_default(),
-            two_factor_secret: two_factor_secret.unwrap_or_default(),
-            two_factor_algorithm: two_factor_algorithm.unwrap_or_else(|| "sha1".to_string()),
+            relay_auth_token: relay_auth_token.unwrap_or_default(),
         };
 
         let manager = Arc::new(ProxyManager::new(config));
