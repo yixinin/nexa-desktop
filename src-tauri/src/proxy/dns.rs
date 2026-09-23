@@ -2,20 +2,25 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+
+use crate::proxy::tun_proxy::tun_base;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
-/// Start of the virtual IP range (10.0.0.2 ~ 10.0.0.253)
-const VIRTUAL_IP_START: u32 = 0x0A000002; // 10.0.0.2
-const VIRTUAL_IP_END: u32 = 0x0A0000FD; // 10.0.0.253
+/// Host part of the first and last virtual IP handed out to a proxied domain (…2 … …253).
+///
+/// Deliberately not absolute addresses: the block the TUN lands on is only known once the
+/// interface is up (see `tun_proxy::tun_base`), so the base is applied at allocation time.
+const VIRTUAL_IP_FIRST_HOST: u32 = 0x02;
+const VIRTUAL_IP_LAST_HOST: u32 = 0xFD;
 
 /// IP -> domain mapping table
 #[derive(Debug)]
 pub struct IpMapping {
     ip_to_domain: Mutex<HashMap<u32, String>>,
     domain_to_ip: Mutex<HashMap<String, u32>>,
-    next_ip: Mutex<u32>,
+    next_host: Mutex<u32>,
 }
 
 impl IpMapping {
@@ -23,7 +28,7 @@ impl IpMapping {
         Self {
             ip_to_domain: Mutex::new(HashMap::new()),
             domain_to_ip: Mutex::new(HashMap::new()),
-            next_ip: Mutex::new(VIRTUAL_IP_START),
+            next_host: Mutex::new(VIRTUAL_IP_FIRST_HOST),
         }
     }
 
@@ -39,15 +44,17 @@ impl IpMapping {
             }
         }
 
-        // Allocate a new IP
-        let mut next_ip = self.next_ip.lock();
-        let ip = *next_ip;
+        // Allocate a new IP. Only the host part is remembered: the block the TUN ended up on is
+        // not known when this mapping is created (it is chosen once the interface is up), so an
+        // absolute address frozen here could belong to a block nobody routes.
+        let mut next_host = self.next_host.lock();
+        let ip = u32::from(tun_base()) | *next_host;
 
         // Wrap around once the range is exhausted
-        if *next_ip >= VIRTUAL_IP_END {
-            *next_ip = VIRTUAL_IP_START;
+        if *next_host >= VIRTUAL_IP_LAST_HOST {
+            *next_host = VIRTUAL_IP_FIRST_HOST;
         } else {
-            *next_ip += 1;
+            *next_host += 1;
         }
 
         self.ip_to_domain.lock().insert(ip, domain_lower.clone());

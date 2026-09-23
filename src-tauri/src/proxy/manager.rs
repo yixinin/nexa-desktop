@@ -180,6 +180,9 @@ struct ProxyInstance {
     tun_proxy: Option<Arc<TunProxy>>,
     local_proxy: Option<Arc<LocalProxyWrapper>>,
     endpoint_group: Option<Arc<EndpointGroup>>,
+    /// Our own iroh endpoint id: what the UI shows as "this machine", and what a server-side
+    /// auth entry has to name when it keys 2FA by client id.
+    local_node_id: String,
 }
 
 impl ProxyInstance {
@@ -219,7 +222,8 @@ impl ProxyManager {
     }
 
     pub fn get_mode(&self) -> Option<ProxyMode> {
-        self.mode.lock().clone()
+        // `ProxyMode` is `Copy`, so this is a dereference, not a clone.
+        *self.mode.lock()
     }
 
     pub async fn stop(&self) {
@@ -300,6 +304,8 @@ impl ProxyManager {
         let iroh_endpoint = ep_builder.bind().await
             .map_err(|e| anyhow::anyhow!("Failed to bind iroh endpoint: {}", e))?;
         tracing::info!("Iroh endpoint bound, node_id={}", iroh_endpoint.id());
+        // Taken before the endpoint is handed to the group, which owns it from here on.
+        let local_node_id = iroh_endpoint.id().to_string();
 
         let endpoint_group =
             EndpointGroup::new_with_nodes_and_endpoint(nodes.clone(), None, self.config.load_balancing.into(), iroh_endpoint)
@@ -398,15 +404,14 @@ impl ProxyManager {
         }
 
         if self.config.use_tun {
-            if !TunProxy::is_available().await {
-                // Requested but not granted: fail loudly instead of forwarding traffic through a
-                // local proxy the user did not ask for. Callers translate this into
-                // `proxy.tun_unavailable`.
-                return Err(StartError::Other(anyhow::anyhow!(
-                    "TUN mode was requested but this process has no privileges to create the tunnel"
-                )));
-            }
-
+            // No `TunProxy::is_available()` pre-flight any more. That probe is a bare `is_admin()`
+            // (`net session` on Windows), and it is the wrong question: what matters is whether
+            // the device can be created, which is what `run()` tries next and reports verbatim.
+            // The service runs as LocalSystem, where the probe answers false even though the
+            // tunnel can be created — so this check alone refused every service-mode TUN start a
+            // couple of seconds in, once the endpoint bind and the reachability probe had
+            // finished. Callers that want to refuse before touching anything (the desktop process,
+            // which is never elevated) still do their own check.
             tracing::info!("TUN mode requested, starting TUN + DNS hijack mode");
 
             // Starting the local DNS server and switching system DNS is handled inside
@@ -438,6 +443,7 @@ impl ProxyManager {
                 tun_proxy: Some(tun_proxy.clone()),
                 local_proxy: None,
                 endpoint_group: Some(endpoint_group.clone()),
+                local_node_id: local_node_id.clone(),
             });
             *self.mode.lock() = Some(ProxyMode::Tun);
 
@@ -491,6 +497,7 @@ impl ProxyManager {
             tun_proxy: None,
             local_proxy: Some(local_proxy.clone()),
             endpoint_group: Some(endpoint_group.clone()),
+            local_node_id: local_node_id.clone(),
         });
 
         // Spawn the local proxy run loop as a separate task. This keeps the
@@ -509,8 +516,14 @@ impl ProxyManager {
         Ok(())
     }
 
+    /// Our own endpoint id, or `None` when nothing is running.
+    ///
+    /// It used to be a stub that always answered `None`, which made every poll log
+    /// `proxy.node_id_unavailable` — noise that looked exactly like a proxy that had died.
     pub async fn get_node_id(&self) -> Option<String> {
-        None
+        // Cloned out of the lock before anything else: a parking_lot guard must not be held
+        // across a suspension point.
+        self.instance.lock().as_ref().map(|i| i.local_node_id.clone())
     }
 
     /// How each configured node currently reaches its backend: direct, or through a relay.

@@ -57,7 +57,7 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
 
 /// Runs the IPC server that the UI talks to.
 pub fn run_daemon() {
-    let _guard = crate::init_tracing("nexa-service.log");
+    let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
     tracing::info!("Starting as daemon");
 
     #[cfg(unix)]
@@ -78,7 +78,7 @@ pub fn run_daemon() {
 /// Entry point used by the Windows service control manager (`--service`).
 #[cfg(windows)]
 fn run_native_service() -> bool {
-    let _guard = crate::init_tracing("nexa-service.log");
+    let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
     tracing::info!("Starting as Windows service");
 
     if let Err(e) = crate::service::windows_service::run() {

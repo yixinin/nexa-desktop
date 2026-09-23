@@ -2,7 +2,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::error::{codes, AppError};
-use crate::service::ipc::{IpcMessage, IpcResponse, NodeInput, StartProxyRequest, IPC_SOCKET_PATH};
+use crate::service::ipc::{IpcMessage, IpcResponse, StartProxyRequest, IPC_SOCKET_PATH};
 use crate::status::{EndpointLink, ProxyStatus};
 
 pub struct IpcClient;
@@ -73,33 +73,8 @@ impl IpcClient {
         Ok(response)
     }
 
-    pub async fn start_proxy(
-        nodes: Vec<NodeInput>,
-        domains: Vec<String>,
-        local_addr: Option<String>,
-        dns_addr: Option<String>,
-        upstream_dns: Option<String>,
-        load_balancing: Option<String>,
-        tun_name: Option<String>,
-        use_tun: bool,
-        relay_mode: Option<String>,
-        relay_url: Option<String>,
-        relay_auth_token: Option<String>,
-    ) -> Result<(), AppError> {
-        let response = Self::send_message(IpcMessage::StartProxy(StartProxyRequest {
-            nodes,
-            domains,
-            local_addr,
-            dns_addr,
-            upstream_dns,
-            load_balancing,
-            tun_name,
-            use_tun: Some(use_tun),
-            relay_mode,
-            relay_url,
-            relay_auth_token,
-        }))
-        .await?;
+    pub async fn start_proxy(request: StartProxyRequest) -> Result<(), AppError> {
+        let response = Self::send_message(IpcMessage::StartProxy(Box::new(request))).await?;
 
         match response {
             IpcResponse::Ok => Ok(()),
@@ -139,6 +114,17 @@ impl IpcClient {
     pub async fn get_endpoint_links() -> Result<Vec<EndpointLink>, AppError> {
         match Self::send_message(IpcMessage::GetEndpointLinks).await? {
             IpcResponse::EndpointLinks(links) => Ok(links),
+            IpcResponse::Error(e) => Err(e),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The failure the service's last start recorded after it had already answered `Ok`.
+    ///
+    /// `None` is a legitimate answer, not an error: it means the start settled.
+    pub async fn get_startup_error() -> Result<Option<AppError>, AppError> {
+        match Self::send_message(IpcMessage::GetStartupError).await? {
+            IpcResponse::StartupError(e) => Ok(e),
             IpcResponse::Error(e) => Err(e),
             other => Err(unexpected(&other)),
         }

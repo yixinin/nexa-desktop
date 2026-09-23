@@ -6,11 +6,37 @@ import { useI18n } from "vue-i18n";
 import AppToggle from "../components/base/AppToggle.vue";
 import { useConfigStore } from "../stores/config";
 import { useProxyStore } from "../stores/proxy";
+import { useTheme } from "../composables/useTheme";
+import { useLocale } from "../composables/useLocale";
+import type { ThemePreference } from "../stores/prefs";
 
 const { t } = useI18n();
 const { config, updateConfig } = useConfigStore();
 // Toggling the backend changes where the status comes from, so the panel has to re-read it.
 const { refreshServiceRunning } = useProxyStore();
+
+/**
+ * Appearance is the one group that is not proxy configuration: theme and language are stored as
+ * UI preferences, and both apply live — no reload, and no re-entering the page.
+ */
+const { preference: themePreference, setTheme } = useTheme();
+const { locale, options: localeOptions, setLocale } = useLocale();
+
+/** Labels are i18n keys: the language list is the control that has to stay readable in any UI
+ *  language, so both selects resolve their text where they render. */
+const themeOptions: { value: ThemePreference; label: string }[] = [
+  { value: 'system', label: 'appearance.themeSystem' },
+  { value: 'light', label: 'appearance.themeLight' },
+  { value: 'dark', label: 'appearance.themeDark' },
+];
+
+function onThemeChange(event: Event): void {
+  setTheme((event.target as HTMLSelectElement).value as ThemePreference);
+}
+
+function onLocaleChange(event: Event): void {
+  setLocale((event.target as HTMLSelectElement).value);
+}
 
 /**
  * Whether the proxy runs inside the app or through the installed system service.
@@ -57,7 +83,59 @@ loadSettings();
   <div class="settings-page">
     <div class="settings-section">
       <div class="card-header">
-        <h2>Service Management</h2>
+        <h2>{{ t('appearance.title') }}</h2>
+        <div class="card-header-decoration"></div>
+      </div>
+
+      <div class="settings-list">
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="5"/>
+              <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('appearance.theme') }}</span>
+              <span class="setting-hint">{{ t('appearance.themeHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <select class="select-input" :value="themePreference" @change="onThemeChange">
+              <option v-for="option in themeOptions" :key="option.value" :value="option.value">
+                {{ t(option.label) }}
+              </option>
+            </select>
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <div class="setting-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="2" y1="12" x2="22" y2="12"/>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+            </svg>
+            <div class="setting-info">
+              <span class="setting-label">{{ t('appearance.language') }}</span>
+              <span class="setting-hint">{{ t('appearance.languageHint') }}</span>
+            </div>
+          </div>
+          <div class="setting-right">
+            <!-- Options carry their native name, so the control stays findable even when the
+                 rest of the UI is in a language the reader does not understand. -->
+            <select class="select-input" :value="locale" @change="onLocaleChange">
+              <option v-for="option in localeOptions" :key="option.value" :value="option.value">
+                {{ option.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <div class="card-header">
+        <h2>{{ t('service.title') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
@@ -74,7 +152,7 @@ loadSettings();
 
     <div class="settings-section">
       <div class="card-header">
-        <h2>TUN Settings</h2>
+        <h2>{{ t('settings.tun') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
 
@@ -88,8 +166,8 @@ loadSettings();
               <line x1="2" y1="8.5" x2="12" y2="15.5"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">TUN Device Name</span>
-              <span class="setting-hint">Virtual network interface name (auto-assigned by macOS; ignored on that platform)</span>
+              <span class="setting-label">{{ t('settings.tunDeviceName') }}</span>
+              <span class="setting-hint">{{ t('settings.tunDeviceNameHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -108,7 +186,7 @@ loadSettings();
     
     <div class="settings-section">
       <div class="card-header">
-        <h2>Relay Settings</h2>
+        <h2>{{ t('settings.relay') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
 
@@ -121,8 +199,8 @@ loadSettings();
               <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Relay Mode</span>
-              <span class="setting-hint">Configure the iroh relay forwarding mode</span>
+              <span class="setting-label">{{ t('settings.relayMode') }}</span>
+              <span class="setting-hint">{{ t('settings.relayModeHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -131,10 +209,10 @@ loadSettings();
               class="select-input"
               @change="updateConfig({ relayMode: config.relayMode })"
             >
-              <option value="pinned">Pinned (aps1-1, stable)</option>
-              <option value="default">Default (all N0 relays)</option>
-              <option value="disabled">Disabled (no relay at all)</option>
-              <option value="custom">Custom URL (exclusive)</option>
+              <option value="pinned">{{ t('settings.relayPinned') }}</option>
+              <option value="default">{{ t('settings.relayDefault') }}</option>
+              <option value="disabled">{{ t('settings.relayDisabled') }}</option>
+              <option value="custom">{{ t('settings.relayCustom') }}</option>
             </select>
           </div>
         </div>
@@ -146,8 +224,8 @@ loadSettings();
               <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Relay URL</span>
-              <span class="setting-hint">Required, and used on its own — no N0 relay. Applies on the next start.</span>
+              <span class="setting-label">{{ t('settings.relayUrl') }}</span>
+              <span class="setting-hint">{{ t('settings.relayUrlHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -167,8 +245,8 @@ loadSettings();
               <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Relay auth token</span>
-              <span class="setting-hint">Only if the relay requires one. The server needs the same token.</span>
+              <span class="setting-label">{{ t('settings.relayAuthToken') }}</span>
+              <span class="setting-hint">{{ t('settings.relayAuthTokenHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -176,7 +254,7 @@ loadSettings();
               v-model="config.relayAuthToken"
               class="text-input"
               type="password"
-              placeholder="optional"
+              :placeholder="t('common.optional')"
               @change="updateConfig({ relayAuthToken: config.relayAuthToken.trim() })"
             />
           </div>
@@ -188,7 +266,7 @@ loadSettings();
 
 <div class="settings-section">
       <div class="card-header">
-        <h2>App Settings</h2>
+        <h2>{{ t('settings.app') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
@@ -200,8 +278,8 @@ loadSettings();
               <circle cx="12" cy="12" r="10"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Launch at Startup</span>
-              <span class="setting-hint">Automatically run the proxy when the app launches</span>
+              <span class="setting-label">{{ t('settings.launchAtStartup') }}</span>
+              <span class="setting-hint">{{ t('settings.launchAtStartupHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -221,8 +299,8 @@ loadSettings();
               <path d="M5 12h14M12 5l7 7-7 7"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Minimize on Close</span>
-              <span class="setting-hint">Minimize to the system tray when the close button is clicked</span>
+              <span class="setting-label">{{ t('settings.minimizeOnClose') }}</span>
+              <span class="setting-hint">{{ t('settings.minimizeOnCloseHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
@@ -244,17 +322,17 @@ loadSettings();
               <line x1="16" y1="13" x2="8" y2="13"/>
             </svg>
             <div class="setting-info">
-              <span class="setting-label">Log Level</span>
-              <span class="setting-hint">Controls the verbosity of log output</span>
+              <span class="setting-label">{{ t('settings.logLevel') }}</span>
+              <span class="setting-hint">{{ t('settings.logLevelHint') }}</span>
             </div>
           </div>
           <div class="setting-right">
             <select v-model="logLevel" class="select-input">
-              <option value="trace">Trace</option>
-              <option value="debug">Debug</option>
-              <option value="info">Info</option>
-              <option value="warn">Warn</option>
-              <option value="error">Error</option>
+              <option value="trace">{{ t('logs.levelTrace') }}</option>
+              <option value="debug">{{ t('logs.levelDebug') }}</option>
+              <option value="info">{{ t('logs.levelInfo') }}</option>
+              <option value="warn">{{ t('logs.levelWarn') }}</option>
+              <option value="error">{{ t('logs.levelError') }}</option>
             </select>
           </div>
         </div>
@@ -263,21 +341,21 @@ loadSettings();
 
     <div class="settings-section">
       <div class="card-header">
-        <h2>About</h2>
+        <h2>{{ t('settings.about') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
       <div class="about-info">
         <div class="about-item">
-          <span class="about-label">Version</span>
+          <span class="about-label">{{ t('common.version') }}</span>
           <span class="about-value">v0.1.0</span>
         </div>
         <div class="about-item">
-          <span class="about-label">Built With</span>
+          <span class="about-label">{{ t('settings.builtWith') }}</span>
           <span class="about-value">Tauri + Vue 3</span>
         </div>
         <div class="about-item">
-          <span class="about-label">License</span>
+          <span class="about-label">{{ t('settings.license') }}</span>
           <span class="about-value">MIT License</span>
         </div>
       </div>

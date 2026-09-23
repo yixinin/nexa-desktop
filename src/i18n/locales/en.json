@@ -43,6 +43,7 @@
     "enabled": "Enabled",
     "disabled": "Disabled",
     "unknown": "Unknown",
+    "optional": "optional",
     "details": "Technical details",
     "version": "Version"
   },
@@ -63,7 +64,19 @@
   },
   "mode": {
     "tun": "TUN",
-    "local_proxy": "Local Proxy"
+    "local_proxy": "Local Proxy",
+    "not_running": "Not running"
+  },
+  "connection": {
+    "ticket": "Ticket",
+    "endpointId": "Endpoint ID",
+    "hybrid": "Hybrid",
+    "notConfigured": "Not configured"
+  },
+  "link": {
+    "direct": "Direct",
+    "relay": "Relay",
+    "connecting": "Connecting"
   },
   "connect": {
     "title": "Connect",
@@ -85,7 +98,15 @@
     "tunRestartTitle": "Restart the proxy?",
     "tunRestartMessage": "The proxy is running. Switching to {mode} stops it and starts it again.",
     "tunUnavailableServiceGone": "The system service is no longer available, so TUN mode was turned off.",
-    "modeMismatch": "The proxy is running in {mode} mode, which is not what you selected."
+    "modeMismatch": "The proxy is running in {mode} mode, which is not what you selected.",
+    "connectionMethod": "Connection Method",
+    "proxyMode": "Proxy Mode",
+    "domainCount": "Domain Count",
+    "nodeCount": "Node Count",
+    "nodeList": "Node List",
+    "nodeCountBadge": "{count} nodes",
+    "noNodes": "No nodes configured",
+    "noNodesHint": "Import an invite on the Config page to add one"
   },
   "appearance": {
     "title": "Appearance",
@@ -123,7 +144,67 @@
   },
   "config": {
     "noNodes": "No nodes yet",
-    "noNodesHint": "Nodes come from an invite. Import one to start routing domains."
+    "noNodesHint": "Nodes come from an invite. Import one to start routing domains.",
+    "nodeConfiguration": "Node Configuration",
+    "domainOverview": "Domain Overview",
+    "network": "Network Configuration",
+    "loadBalancing": "Load Balancing Configuration",
+    "proxiedDomains": "Proxied Domain List",
+    "domainsPlaceholder": "One domain per line",
+    "domainsCount": "{count} domains",
+    "multipleNodesHint": "Multiple nodes are supported; the same domain can be configured on several nodes for load balancing",
+    "noDomains": "No domains configured",
+    "overviewHint": "Shows the unique domains configured across all nodes, {count} in total",
+    "localAddr": "Local Proxy Address",
+    "dnsAddr": "DNS Listen Address",
+    "upstreamDns": "Upstream DNS",
+    "strategyRoundRobin": "Round Robin",
+    "strategyRoundRobinDesc": "Distribute requests to each node in turn",
+    "strategyRandom": "Random",
+    "strategyRandomDesc": "Pick a node at random",
+    "loadExample": "Load Example",
+    "clearConfig": "Clear Config",
+    "nodeFallback": "Node {index}"
+  },
+  "settings": {
+    "tun": "TUN Settings",
+    "tunDeviceName": "TUN Device Name",
+    "tunDeviceNameHint": "Virtual network interface name (auto-assigned on macOS; ignored there)",
+    "relay": "Relay Settings",
+    "relayMode": "Relay Mode",
+    "relayModeHint": "Configure the iroh relay forwarding mode",
+    "relayPinned": "Pinned (aps1-1, stable)",
+    "relayDefault": "Default (all N0 relays)",
+    "relayDisabled": "Disabled (no relay at all)",
+    "relayCustom": "Custom URL (exclusive)",
+    "relayUrl": "Relay URL",
+    "relayUrlHint": "Required, and used on its own — no N0 relay. Applies on the next start.",
+    "relayAuthToken": "Relay auth token",
+    "relayAuthTokenHint": "Only if the relay requires one. The server needs the same token.",
+    "app": "App Settings",
+    "launchAtStartup": "Launch at Startup",
+    "launchAtStartupHint": "Automatically run the proxy when the app launches",
+    "minimizeOnClose": "Minimize on Close",
+    "minimizeOnCloseHint": "Minimize to the system tray when the close button is clicked",
+    "logLevel": "Log Level",
+    "logLevelHint": "Controls the verbosity of log output",
+    "about": "About",
+    "builtWith": "Built With",
+    "license": "License"
+  },
+  "logs": {
+    "levelAll": "All Levels",
+    "levelTrace": "Trace",
+    "levelDebug": "Debug",
+    "levelInfo": "Info",
+    "levelWarn": "Warn",
+    "levelError": "Error",
+    "autoScroll": "Auto Scroll",
+    "copy": "Copy Logs",
+    "clear": "Clear Logs",
+    "cleared": "Logs cleared",
+    "empty": "No logs yet",
+    "entryCount": "{count} log entries"
   },
   "invite": {
     "import": "Import invite",

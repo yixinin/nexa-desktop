@@ -84,12 +84,22 @@ pub enum IpcMessage {
     /// Everything else is refused until this succeeds, because the service runs
     /// elevated and a loopback socket says nothing about who dialled it.
     Auth(String),
-    StartProxy(StartProxyRequest),
+    /// Boxed: `StartProxyRequest` is ~250 bytes while every other variant is a
+    /// `String` or a `Vec`, so the enum would otherwise be sized after its rarest
+    /// variant and every message would pay for it.
+    StartProxy(Box<StartProxyRequest>),
     StopProxy,
     GetStatus,
     GetNodeId,
     /// How each configured node currently reaches its backend (direct / relay).
     GetEndpointLinks,
+    /// The failure the last [`IpcMessage::StartProxy`] recorded after it had already answered
+    /// `Ok`, if any.
+    ///
+    /// The proxy starts on a spawned task and the service cannot wait for it — a TUN run loop
+    /// only returns when the tunnel goes down — so a start that fails a second later would
+    /// otherwise leave the caller with nothing but "it stopped again".
+    GetStartupError,
 }
 
 /// What the service sends back.
@@ -108,6 +118,8 @@ pub enum IpcResponse {
     Status(ProxyStatus),
     NodeId(String),
     EndpointLinks(Vec<EndpointLink>),
+    /// `None` means the last start settled without a failure.
+    StartupError(Option<AppError>),
 }
 
 #[cfg(test)]

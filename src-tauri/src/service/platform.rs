@@ -144,6 +144,28 @@ mod windows_impl {
     /// Argument that hands control to the service control manager.
     const SERVICE_ARGUMENT: &str = "--service";
 
+    /// `sc start` on a service that is already running.
+    ///
+    /// Not a failure: running is the state the command asked for. Reported as it is, the exit
+    /// code turns a successful install into `service.install_failed` carrying
+    /// "StartService 失败 1056" — an install that worked, described as one that did not.
+    const ALREADY_RUNNING: &str = "1056";
+
+    /// `sc stop` on a service that is not started (or not installed).
+    ///
+    /// Same shape: the state asked for is already the state, so refusing to call it a success
+    /// only stops a perfectly good stop from ever being reported as done.
+    const NOT_STARTED: &str = "1062";
+    const NOT_INSTALLED: &str = "1060";
+
+    /// Accepts a nonzero exit code from the previous command as success.
+    ///
+    /// `errorlevel` is compared literally rather than with `if errorlevel N` because that form
+    /// means "N or higher" and would swallow real failures with larger codes.
+    fn tolerate(code: &str) -> String {
+        format!("if %errorlevel%=={code} exit /b 0")
+    }
+
     /// Whether an operation can succeed without asking for elevation.
     enum Escalation {
         /// It always needs administrative rights (`sc create`).
@@ -172,6 +194,11 @@ mod windows_impl {
                     format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
                     "if errorlevel 1 exit /b %errorlevel%".to_string(),
                     format!("sc.exe start {SERVICE_NAME}"),
+                    // Already running is the state the install asked for. Note that the service
+                    // keeps running the binary it was launched from: a re-pointed `binPath`
+                    // only takes effect on the next start, which an uninstall/start or a reboot
+                    // provides.
+                    tolerate(ALREADY_RUNNING),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -212,6 +239,7 @@ mod windows_impl {
             |_| {
                 vec![
                     format!("sc.exe start {SERVICE_NAME}"),
+                    tolerate(ALREADY_RUNNING),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -227,6 +255,8 @@ mod windows_impl {
             |_| {
                 vec![
                     format!("sc.exe stop {SERVICE_NAME}"),
+                    tolerate(NOT_STARTED),
+                    tolerate(NOT_INSTALLED),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },

@@ -3,7 +3,7 @@
 //!
 //! - Windows: netsh (same as the previous implementation)
 //! - Linux:   resolvectl (systemd-resolved), falling back to overwriting /etc/resolv.conf
-//!            (with a backup)
+//!   (with a backup)
 //! - macOS:   networksetup (iterating over every network service)
 //!
 //! Note: the local DNS server (proxy/dns.rs) must be started before `set_system_dns`,

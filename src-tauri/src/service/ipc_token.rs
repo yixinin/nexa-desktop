@@ -115,21 +115,36 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
     }
 }
 
-/// The token a caller has to present, when one has been published.
+/// Every token that has been published, in the order [`service_token_paths`] finds them.
 ///
-/// `None` is not "authentication is off": it means no desktop session has
-/// published a token, so there is no legitimate caller and every privileged
-/// message gets refused.
-///
-/// Looks past [`token_path`] because the service may not resolve that path the
-/// way the desktop session does — see [`service_token_paths`].
-pub fn read_token() -> Result<Option<String>, AppError> {
+/// All of them, not just the first: on Windows the service scans every profile on the machine
+/// because a loopback socket says nothing about which account dialled it, so which candidate
+/// happens to come first tells it nothing about which token the caller holds. A caller is
+/// legitimate when it presents any one of them — see [`token_matches_any`].
+pub fn read_tokens() -> Result<Vec<String>, AppError> {
+    let mut tokens = Vec::new();
     for candidate in service_token_paths() {
         if let Some(token) = read_token_at(&candidate)? {
-            return Ok(Some(token));
+            tokens.push(token);
         }
     }
-    Ok(None)
+    Ok(tokens)
+}
+
+/// The first published token, when one exists.
+///
+/// `None` is not "authentication is off": it means no desktop session has published a token,
+/// so there is no legitimate caller and every privileged message gets refused.
+///
+/// Looks past [`token_path`] because the service may not resolve that path the way the desktop
+/// session does — see [`service_token_paths`].
+pub fn read_token() -> Result<Option<String>, AppError> {
+    Ok(read_tokens()?.into_iter().next())
+}
+
+/// Whether `presented` is one of the published tokens.
+pub fn token_matches_any(tokens: &[String], presented: &str) -> bool {
+    tokens.iter().any(|token| token_matches(token, presented))
 }
 
 /// Every place the service looks for a token, in order.
@@ -156,34 +171,74 @@ fn service_token_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// `<Users>\<profile>\AppData\Local\nexapipe\ipc.token` for every profile on
-/// the machine, best effort.
+/// `<profiles root>\<profile>\AppData\Local\nexapipe\ipc.token` for every profile found under
+/// every plausible profiles root, best effort.
 #[cfg(windows)]
 fn profile_token_paths() -> Vec<PathBuf> {
-    // `%USERPROFILE%` is `C:\Users\<name>` when the service has one at all; its
-    // parent is the profiles root. Anything unexpected just yields nothing, and
-    // the service then fails closed with "no token on file".
-    let Ok(profile) = std::env::var("USERPROFILE") else {
-        return Vec::new();
-    };
-    let Some(profiles_root) = Path::new(&profile).parent() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(profiles_root) else {
-        return Vec::new();
-    };
+    let mut paths = Vec::new();
 
-    entries
-        .filter_map(Result::ok)
-        .map(|entry| {
+    for root in profile_roots() {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+
+        paths.extend(entries.filter_map(Result::ok).map(|entry| {
             entry
                 .path()
                 .join("AppData")
                 .join("Local")
                 .join(TOKEN_DIR)
                 .join(TOKEN_FILE)
-        })
-        .collect()
+        }));
+    }
+
+    paths
+}
+
+/// Where user profiles live.
+///
+/// `USERPROFILE` is tried first because it is right whenever the service runs as the account
+/// that installed it — a dev build, or a launchd/systemd user agent. Under **LocalSystem** it
+/// is `C:\Windows\System32\config\systemprofile`, whose parent is the *config* directory and
+/// not the profiles root: scanning the parent then yields nothing at all, which is exactly how
+/// the service came to answer "no desktop session has published an IPC token" while the token
+/// sat in `C:\Users\<name>\AppData\Local\nexapipe\ipc.token`. `PUBLIC` (`C:\Users\Public`) and
+/// `%SystemDrive%\Users` both resolve to the real root for that account, so they are tried too.
+#[cfg(windows)]
+fn profile_roots() -> Vec<PathBuf> {
+    profile_roots_from(
+        std::env::var("USERPROFILE").ok().as_deref(),
+        std::env::var("PUBLIC").ok().as_deref(),
+        std::env::var("SystemDrive").ok().as_deref(),
+    )
+}
+
+/// [`profile_roots`] over explicit inputs, so the LocalSystem case can be tested without
+/// mutating the process environment.
+#[cfg(windows)]
+fn profile_roots_from(
+    user_profile: Option<&str>,
+    public: Option<&str>,
+    system_drive: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut add = |root: PathBuf| {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    };
+
+    if let Some(parent) = user_profile.and_then(|p| Path::new(p).parent()) {
+        add(parent.to_path_buf());
+    }
+    if let Some(parent) = public.and_then(|p| Path::new(p).parent()) {
+        add(parent.to_path_buf());
+    }
+    if let Some(drive) = system_drive {
+        add(Path::new(drive).join("Users"));
+    }
+
+    roots
 }
 
 /// [`read_token`] against an explicit path.
@@ -286,7 +341,11 @@ fn permissions(path: &Path) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_token_at, read_token_at, service_token_paths, token_matches};
+    use super::{
+        ensure_token_at, read_token_at, service_token_paths, token_matches, token_matches_any,
+    };
+    #[cfg(windows)]
+    use super::profile_roots_from;
     use std::path::PathBuf;
 
     /// Every test gets its own file, so none of them can see the others' state.
@@ -349,5 +408,35 @@ mod tests {
         assert!(!token_matches("abc123", "abc124"));
         assert!(!token_matches("abc123", "abc1234"));
         assert!(!token_matches("abc123", "ABC123"));
+    }
+
+    #[test]
+    fn any_published_token_authenticates() {
+        let tokens = vec!["first".to_string(), "second".to_string()];
+        assert!(token_matches_any(&tokens, "second"));
+        assert!(!token_matches_any(&tokens, "third"));
+        assert!(!token_matches_any(&[], "first"));
+    }
+
+    /// A Windows service runs as LocalSystem, whose `USERPROFILE` is the *system* profile —
+    /// `C:\Windows\System32\config\systemprofile`. Its parent is the config directory, not the
+    /// profiles root, so trusting it alone finds no user token at all and the service answers
+    /// "no desktop session has published an IPC token" while the token is sitting in
+    /// `C:\Users\<name>\AppData\Local\nexapipe\ipc.token`.
+    #[cfg(windows)]
+    #[test]
+    fn the_profiles_root_is_found_when_running_as_local_system() {
+        let roots = profile_roots_from(
+            Some(r"C:\Windows\System32\config\systemprofile"),
+            Some(r"C:\Users\Public"),
+            Some("C:"),
+        );
+
+        assert!(
+            roots.iter().any(|root| root == std::path::Path::new(r"C:\Users")),
+            "the real profiles root must be a candidate: {roots:?}"
+        );
+        // The misleading one is still tried — it costs a directory scan and nothing else.
+        assert!(roots.contains(&PathBuf::from(r"C:\Windows\System32\config")));
     }
 }

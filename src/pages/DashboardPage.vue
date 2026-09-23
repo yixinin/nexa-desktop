@@ -64,21 +64,25 @@ function kindIcon(kind: LinkKind): string {
 }
 
 function kindLabel(kind: LinkKind): string {
-  return kind === "direct" ? "Direct" : kind === "relay" ? "Relay" : "Connecting";
+  return kind === "direct"
+    ? t("link.direct")
+    : kind === "relay"
+      ? t("link.relay")
+      : t("link.connecting");
 }
 
 const connectionLabel = computed(() => {
-  if (nodes.value.length === 0) return 'Not configured';
+  if (nodes.value.length === 0) return t('connection.notConfigured');
   const hasTicket = nodes.value.some(n => n.connectionType === 'ticket');
   const hasEndpoint = nodes.value.some(n => n.connectionType === 'endpoint_id');
-  if (hasTicket && hasEndpoint) return 'Hybrid';
-  return hasTicket ? 'Ticket' : 'Endpoint ID';
+  if (hasTicket && hasEndpoint) return t('connection.hybrid');
+  return hasTicket ? t('connection.ticket') : t('connection.endpointId');
 });
 
 /** The mode the proxy is *actually* running in, which is not always the one that was asked for. */
 const modeLabel = computed(() => {
-  if (!status.value.running) return 'Not running';
-  return status.value.mode === 'tun' ? 'TUN' : 'Local Proxy';
+  if (!status.value.running) return t('mode.not_running');
+  return status.value.mode === 'tun' ? t('mode.tun') : t('mode.local_proxy');
 });
 
 const modeColor = computed(() => {
@@ -127,7 +131,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ connectionLabel }}</span>
-          <span class="stat-label">Connection Method</span>
+          <span class="stat-label">{{ t('connect.connectionMethod') }}</span>
         </div>
       </div>
 
@@ -142,7 +146,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value" :style="{ color: modeColor }">{{ modeLabel }}</span>
-          <span class="stat-label">Proxy Mode</span>
+          <span class="stat-label">{{ t('connect.proxyMode') }}</span>
         </div>
       </div>
 
@@ -155,7 +159,7 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ uniqueDomains }}</span>
-          <span class="stat-label">Domain Count</span>
+          <span class="stat-label">{{ t('connect.domainCount') }}</span>
         </div>
       </div>
 
@@ -176,15 +180,15 @@ const uniqueDomains = computed(() => {
         </div>
         <div class="stat-info">
           <span class="stat-value">{{ nodes.length }}</span>
-          <span class="stat-label">Node Count</span>
+          <span class="stat-label">{{ t('connect.nodeCount') }}</span>
         </div>
       </div>
     </div>
 
     <div class="nodes-section">
       <div class="section-header">
-        <h2>Node List</h2>
-        <span class="section-count">{{ nodes.length }} nodes</span>
+        <h2>{{ t('connect.nodeList') }}</h2>
+        <span class="section-count">{{ t('connect.nodeCountBadge', { count: nodes.length }) }}</span>
       </div>
 
       <div v-if="nodes.length === 0" class="empty-state">
@@ -192,8 +196,8 @@ const uniqueDomains = computed(() => {
           <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
           <circle cx="12" cy="12" r="3"/>
         </svg>
-        <span>No nodes configured</span>
-        <span class="empty-hint">Import an invite on the Config page to add one</span>
+        <span>{{ t('connect.noNodes') }}</span>
+        <span class="empty-hint">{{ t('connect.noNodesHint') }}</span>
       </div>
 
       <div v-else class="nodes-list">
@@ -209,9 +213,9 @@ const uniqueDomains = computed(() => {
                 class="type-badge"
                 :class="node.connectionType === 'ticket' ? 'ticket' : 'endpoint'"
               >
-                {{ node.connectionType === 'ticket' ? 'Ticket' : 'Endpoint ID' }}
+                {{ node.connectionType === 'ticket' ? t('connection.ticket') : t('connection.endpointId') }}
               </span>
-              <span class="node-domains-count">{{ node.domains.length }} domains</span>
+              <span class="node-domains-count">{{ t('config.domainsCount', { count: node.domains.length }) }}</span>
             </div>
             <div class="node-value">
               {{ endpointLabel(node) }}

@@ -6,14 +6,16 @@
 //!
 //! - Windows: netsh (the wintun adapter needs an explicit IP)
 //! - Linux:   ip addr / ip link / ip route (the kernel adds the connected route itself;
-//!            an explicit `replace` acts as a fallback)
+//!   an explicit `replace` acts as a fallback)
 //! - macOS:   ifconfig / route (utun interfaces need an explicit IP and route)
 
 use anyhow::Result;
 use std::process::Command;
 
 #[cfg(windows)]
-use crate::proxy::tun_proxy::{TUN_IP, TUN_NETMASK};
+use crate::proxy::tun_proxy::{TUN_BASE_CANDIDATES, TUN_NETMASK, set_tun_base, tun_network};
+#[cfg(windows)]
+use std::net::Ipv4Addr;
 #[cfg(target_os = "macos")]
 use crate::proxy::tun_proxy::{TUN_IP, TUN_NETMASK};
 #[cfg(target_os = "linux")]
@@ -143,69 +145,241 @@ pub fn remove_routes(interface: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn configure_interface_windows(interface: &str) -> Result<()> {
-    // Retry up to 5 times: when netsh reports success the address should be usable right
-    // away, but in some cases Windows needs a moment before it actually attaches the address
-    // to the interface — otherwise the later bind to 10.0.0.254:53 fails with
-    // WSAEADDRNOTAVAIL (10049). Each attempt runs netsh, then verifies the address is
-    // really bindable.
-    for attempt in 1..=5 {
-        let output = Command::new("netsh")
-            .args([
-                "interface",
-                "ip",
-                "set",
-                "address",
-                &format!("name={}", interface),
-                "static",
-                TUN_IP,
-                TUN_NETMASK,
-            ])
-            .output()
-            .map_err(|e| anyhow::anyhow!("Failed to run netsh: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            anyhow::bail!(
-                "netsh set address failed (attempt {}): {} {}",
-                attempt,
-                stderr,
-                stdout
-            );
-        }
+    // Not one address but a list of candidate /24 blocks, tried in order.
+    //
+    // The block used to be fixed at 10.0.0.0/24, which is also what a great many home LANs use.
+    // When the machine's own LAN already occupies it, Windows accepts the configuration and
+    // then never makes the address usable: `netsh` exits 0, the bind to …254:53 fails with
+    // WSAEADDRNOTAVAIL, and the whole proxy dies a couple of seconds after starting. Retrying
+    // the same address cannot help, so once a block has been given a fair chance we move the
+    // TUN to the next one.
+    for base in TUN_BASE_CANDIDATES {
+        let ip = Ipv4Addr::from(u32::from(base) | 0x0000_00FE).to_string();
 
-        // Verify: 10.0.0.254 must already be a locally bindable address (matching the DNS
-        // server bind precondition).
-        if is_local_address_bindable(TUN_IP) {
-            tracing::info!(
-                "Interface {} configured with {} netmask {}",
-                interface,
-                TUN_IP,
-                TUN_NETMASK
-            );
-            return Ok(());
-        }
+        // Three attempts per block: when netsh reports success the address should be usable
+        // straight away, but Windows sometimes needs a moment to attach it to the interface.
+        for attempt in 1..=3 {
+            // The address is set through the IP Helper API, not `netsh`: as a service
+            // (LocalSystem) netsh exits 0 with no output and no effect, which is what made the
+            // TUN address unbindable on every block. `netsh` is kept as a fallback for the cases
+            // where the API refuses.
+            match assign_address_iphelper(interface, &ip) {
+                Ok(()) => tracing::info!(
+                    "IP Helper set {} on {} (attempt {})",
+                    ip,
+                    interface,
+                    attempt
+                ),
+                Err(e) => {
+                    tracing::warn!("IP Helper could not set {} on {}: {}", ip, interface, e);
+                    let output = Command::new("netsh")
+                        .args([
+                            "interface",
+                            "ip",
+                            "set",
+                            "address",
+                            &format!("name={}", interface),
+                            "static",
+                            &ip,
+                            TUN_NETMASK,
+                        ])
+                        .output()
+                        .map_err(|e| anyhow::anyhow!("Failed to run netsh: {}", e))?;
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        tracing::warn!(
-            "netsh set address returned success but {} is not bindable yet (attempt {}), retrying...",
-            TUN_IP,
-            attempt
-        );
-        std::thread::sleep(Duration::from_millis(500));
+                    // Logged unconditionally: netsh exits 0 for a number of failures, so its
+                    // exit code alone cannot say whether the address was taken.
+                    tracing::info!(
+                        "netsh set address {}/{} on {} (attempt {}): exit {} — out: {:?} err: {:?}",
+                        ip,
+                        TUN_NETMASK,
+                        interface,
+                        attempt,
+                        output.status,
+                        stdout,
+                        stderr
+                    );
+
+                    if !output.status.success() {
+                        break;
+                    }
+                }
+            }
+
+            if let Err(e) = bindable(&ip) {
+                // The reason matters: 10049 (not in the local address table) is the usual one,
+                // anything else points somewhere else entirely.
+                tracing::warn!(
+                    "{} is not bindable yet after attempt {}: {}",
+                    ip,
+                    attempt,
+                    e
+                );
+            } else {
+                set_tun_base(base);
+                if base != TUN_BASE_CANDIDATES[0] {
+                    tracing::warn!(
+                        "Moved the TUN to {}: the configured block was already in use on this host",
+                        tun_network()
+                    );
+                }
+                tracing::info!(
+                    "Interface {} configured with {} netmask {}",
+                    interface,
+                    ip,
+                    TUN_NETMASK
+                );
+                return Ok(());
+            }
+
+            tracing::warn!("{} still unusable, retrying...", ip);
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 
+    // Last resort before giving up: say what the machine itself thinks, using a program that is
+    // not the one that may have silently done nothing.
+    let seen = Command::new("ipconfig").output().map(|o| {
+        let text = String::from_utf8_lossy(&o.stdout).to_string();
+        text.contains(interface)
+    });
     anyhow::bail!(
-        "Failed to assign {} to interface {} after 5 attempts: the TUN address is not local, DNS server cannot bind and routing will not work",
-        TUN_IP,
-        interface
+        "Failed to give interface {} any of the candidate TUN blocks ({:?}): the TUN address is never bindable, DNS server cannot bind and routing will not work. \
+         ipconfig mentions the interface: {:?}",
+        interface,
+        TUN_BASE_CANDIDATES,
+        seen
     )
 }
 
+/// Whether `ip` can be bound to: the test the DNS server has to pass before it will start.
 #[cfg(windows)]
-fn is_local_address_bindable(ip: &str) -> bool {
+fn bindable(ip: &str) -> std::io::Result<()> {
     // Bind a temporary UDP socket to the address (port 0, i.e. random). Success means the
     // address really is attached to a local interface; failure (usually WSAEADDRNOTAVAIL,
     // 10049) means it is not ready yet.
-    UdpSocket::bind((ip, 0)).is_ok()
+    UdpSocket::bind((ip, 0)).map(|_| ())
+}
+
+/// Assigns `ip/24` to `interface` through the IP Helper API.
+///
+/// `netsh` is not used for this because it does nothing at all when the process is a service
+/// running as LocalSystem: it exits 0 and prints nothing, and the address never appears. The
+/// documented API has no such dependency on the caller's session.
+#[cfg(windows)]
+fn assign_address_iphelper(interface: &str, ip: &str) -> Result<()> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        CreateUnicastIpAddressEntry, InitializeUnicastIpAddressEntry, MIB_UNICASTIPADDRESS_ROW,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+
+    let addr: std::net::Ipv4Addr = ip
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{ip} is not an IPv4 address: {e}"))?;
+
+    // The interface index is resolved from the friendly name ("nexa-tun"). `GetAdapterIndex`
+    // looks like the obvious API for this but is not usable here: it wants the adapter's
+    // *GUID* name (the `AdapterName` of `GetAdaptersAddresses`, "{…}"), and returns
+    // ERROR_INVALID_PARAMETER (87) for the friendly name — which is all the `tun` crate
+    // exposes. That is exactly what made every candidate block fail in the service log.
+    let ifindex = adapter_index_by_friendly_name(interface)?;
+
+    unsafe {
+        let mut row: MIB_UNICASTIPADDRESS_ROW = std::mem::zeroed();
+        InitializeUnicastIpAddressEntry(&mut row);
+        row.InterfaceIndex = ifindex;
+        row.OnLinkPrefixLength = 24;
+
+        let sin: *mut SOCKADDR_IN = &mut row.Address.Ipv4;
+        (*sin).sin_family = AF_INET;
+        (*sin).sin_port = 0;
+        // IN_ADDR is a union of byte/word/dword views over the same four bytes; writing the
+        // dword view is the one that does not depend on how the union is spelled.
+        std::ptr::write_unaligned(
+            &mut (*sin).sin_addr as *mut _ as *mut u32,
+            u32::from(addr).to_be(),
+        );
+
+        let rc = CreateUnicastIpAddressEntry(&row);
+        match rc {
+            0 => Ok(()),
+            // 5010 = ERROR_OBJECT_ALREADY_EXISTS: the address is there, which is what we asked for.
+            5010 => Ok(()),
+            other => anyhow::bail!("CreateUnicastIpAddressEntry({ip}/{ifindex}) failed: {other}"),
+        }
+    }
+}
+
+/// Resolves an interface index from the adapter's friendly name (e.g. "nexa-tun").
+///
+/// The IP Helper APIs take either an index or a LUID — never the friendly name — and the
+/// `tun` crate only exposes the friendly name. `GetAdapterIndex` is no alternative: it
+/// expects the GUID-shaped `AdapterName` and fails with 87 for anything else.
+#[cfg(windows)]
+fn adapter_index_by_friendly_name(friendly: &str) -> Result<u32> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_UNSPEC;
+
+    // Skip everything the linked list carries but nobody here needs — the list still
+    // contains every adapter, with or without addresses.
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    for _ in 0..4 {
+        // IP_ADAPTER_ADDRESSES_LH starts with a ULONGLONG, so keep the buffer 8-aligned.
+        let mut buf: Vec<u64> = vec![0; size.div_ceil(8) as usize];
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if rc == ERROR_BUFFER_OVERFLOW {
+            // `size` now says how much is actually needed; retry with that.
+            continue;
+        }
+        if rc != 0 {
+            anyhow::bail!("GetAdaptersAddresses failed: {rc}");
+        }
+        let mut cur: *const IP_ADAPTER_ADDRESSES_LH = buf.as_ptr().cast();
+        while !cur.is_null() {
+            let adapter: &IP_ADAPTER_ADDRESSES_LH = unsafe { &*cur };
+            if !adapter.FriendlyName.is_null() {
+                let name = unsafe { wide_ptr_to_string(adapter.FriendlyName) };
+                if name == friendly {
+                    let ifindex = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+                    let guid = unsafe {
+                        std::ffi::CStr::from_ptr(adapter.AdapterName.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    tracing::debug!("adapter {friendly:?} (guid {guid}) has ifindex {ifindex}");
+                    return Ok(ifindex);
+                }
+            }
+            cur = adapter.Next;
+        }
+        anyhow::bail!("no adapter with friendly name {friendly:?} was found");
+    }
+    anyhow::bail!("GetAdaptersAddresses kept asking for a larger buffer");
+}
+
+/// Reads a NUL-terminated UTF-16 string from a pointer into a `String`.
+#[cfg(windows)]
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf16_lossy(slice)
 }
 
 #[cfg(target_os = "linux")]

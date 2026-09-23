@@ -41,13 +41,14 @@ config.nodes.forEach(node => {
   nodeDomainsText.value.set(node.id, node.domains.join("\n"));
 });
 
+/** Label and description are i18n keys, not literals — they are resolved where they render. */
 const loadBalancingOptions: { value: LoadBalancingStrategy; label: string; desc: string }[] = [
-  { value: 'round_robin', label: 'Round Robin', desc: 'Distribute requests to each node in turn' },
-  { value: 'random', label: 'Random', desc: 'Pick a node at random' },
+  { value: 'round_robin', label: 'config.strategyRoundRobin', desc: 'config.strategyRoundRobinDesc' },
+  { value: 'random', label: 'config.strategyRandom', desc: 'config.strategyRandomDesc' },
 ];
 
 function getNodeLabel(node: { name?: string }, index: number): string {
-  return node.name || `Node ${index + 1}`;
+  return node.name || t('config.nodeFallback', { index: index + 1 });
 }
 
 function openInviteDialog() {
@@ -108,7 +109,7 @@ function importInvite(payload: { invite: InvitePayload; applyRelay: boolean }) {
 }
 
 function getNodeTypeLabel(type: ConnectionType): string {
-  return type === 'ticket' ? 'Ticket' : 'Endpoint ID';
+  return type === 'ticket' ? t('connection.ticket') : t('connection.endpointId');
 }
 
 function getNodeTypeColor(type: ConnectionType): string {
@@ -185,7 +186,7 @@ function clearConfig() {
   <div class="config-page">
     <div class="config-section">
       <div class="card-header">
-        <h2>Node Configuration</h2>
+        <h2>{{ t('config.nodeConfiguration') }}</h2>
         <div class="card-header-decoration"></div>
         <button @click="openInviteDialog()" class="import-invite-btn">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -279,8 +280,8 @@ function clearConfig() {
           
           <div class="node-domains-section">
             <label class="form-label">
-              <span class="label-text">Proxied Domain List</span>
-              <span class="domain-count">{{ node.domains.length }} domains</span>
+              <span class="label-text">{{ t('config.proxiedDomains') }}</span>
+              <span class="domain-count">{{ t('config.domainsCount', { count: node.domains.length }) }}</span>
             </label>
             <div class="textarea-wrapper">
               <div class="input-icon">
@@ -295,7 +296,7 @@ function clearConfig() {
                 :value="getNodeDomainsText(node.id)"
                 @input="updateNodeDomainsText(node.id, ($event.target as HTMLTextAreaElement).value)"
                 rows="2"
-                placeholder="One domain per line"
+                :placeholder="t('config.domainsPlaceholder')"
                 class="form-textarea"
               ></textarea>
             </div>
@@ -350,12 +351,12 @@ function clearConfig() {
           </div>
         </div>
       </div>
-      <p v-if="visibleNodes.length > 1" class="hint">Multiple nodes are supported; the same domain can be configured on several nodes for load balancing</p>
+      <p v-if="visibleNodes.length > 1" class="hint">{{ t('config.multipleNodesHint') }}</p>
     </div>
 
     <div class="config-section">
       <div class="card-header">
-        <h2>Domain Overview</h2>
+        <h2>{{ t('config.domainOverview') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
@@ -371,7 +372,7 @@ function clearConfig() {
             <path d="M3 12h5"/>
             <path d="M16 12h5"/>
           </svg>
-          <span>No domains configured</span>
+          <span>{{ t('config.noDomains') }}</span>
         </div>
         <div v-else class="domain-tags">
           <span 
@@ -383,18 +384,18 @@ function clearConfig() {
           </span>
         </div>
       </div>
-      <p class="hint">Shows the unique domains configured across all nodes, {{ allDomains.length }} in total</p>
+      <p class="hint">{{ t('config.overviewHint', { count: allDomains.length }) }}</p>
     </div>
 
     <div class="config-section">
       <div class="card-header">
-        <h2>Network Configuration</h2>
+        <h2>{{ t('config.network') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
       <div class="form-grid">
         <div class="form-group">
-          <label for="localAddr" class="form-label">Local Proxy Address</label>
+          <label for="localAddr" class="form-label">{{ t('config.localAddr') }}</label>
           <div class="input-wrapper">
             <div class="input-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -417,7 +418,7 @@ function clearConfig() {
         </div>
 
         <div class="form-group">
-          <label for="dnsAddr" class="form-label">DNS Listen Address</label>
+          <label for="dnsAddr" class="form-label">{{ t('config.dnsAddr') }}</label>
           <div class="input-wrapper">
             <div class="input-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -436,7 +437,7 @@ function clearConfig() {
         </div>
 
         <div class="form-group">
-          <label for="upstreamDns" class="form-label">Upstream DNS</label>
+          <label for="upstreamDns" class="form-label">{{ t('config.upstreamDns') }}</label>
           <div class="input-wrapper">
             <div class="input-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -457,7 +458,7 @@ function clearConfig() {
 
     <div class="config-section">
       <div class="card-header">
-        <h2>Load Balancing Configuration</h2>
+        <h2>{{ t('config.loadBalancing') }}</h2>
         <div class="card-header-decoration"></div>
       </div>
       
@@ -475,8 +476,8 @@ function clearConfig() {
             class="strategy-radio"
           />
           <div class="strategy-content">
-            <span class="strategy-label">{{ option.label }}</span>
-            <span class="strategy-desc">{{ option.desc }}</span>
+            <span class="strategy-label">{{ t(option.label) }}</span>
+            <span class="strategy-desc">{{ t(option.desc) }}</span>
           </div>
         </label>
       </div>
@@ -488,14 +489,14 @@ function clearConfig() {
           <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
           <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
         </svg>
-        Load Example
+        {{ t('config.loadExample') }}
       </button>
       <button class="btn btn-outline" @click="clearConfig">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <line x1="18" y1="6" x2="6" y2="18"/>
           <line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
-        Clear Config
+        {{ t('config.clearConfig') }}
       </button>
     </div>
 
