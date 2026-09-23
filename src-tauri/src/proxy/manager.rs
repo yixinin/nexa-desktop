@@ -297,7 +297,16 @@ impl ProxyManager {
             );
         }
         tracing::info!("Relay: {}", relay.describe());
+        // Bind IPv4 only. On hosts where IPv6 exists but cannot carry full-size QUIC
+        // datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big" filtered), iroh's net
+        // report calls v6 usable, relay dials and path migration move traffic onto v6 —
+        // where every datagram above the real MTU fails (sendmsg 10040), which reads as a
+        // connection that dies a few seconds in. With no v6 socket the net report stays
+        // v4-only and relay dials stop preferring v6. The TUN is IPv4-only anyway.
         let ep_builder = Endpoint::builder(presets::N0)
+            .clear_ip_transports()
+            .bind_addr("0.0.0.0:0")
+            .map_err(|e| anyhow::anyhow!("Failed to configure the IPv4-only socket: {}", e))?
             .transport_config(transport_tuning.transport_config())
             .relay_mode(relay.relay_mode());
 
