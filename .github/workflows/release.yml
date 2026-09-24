@@ -274,6 +274,11 @@ jobs:
             --target ${{ matrix.target }} \
             --config ci-override.json
 
+      - name: Verify Debian service upgrade packaging
+        if: matrix.os == 'linux'
+        shell: bash
+        run: .github/scripts/verify-deb.sh
+
       - name: Stage build artifacts
         id: stage
         shell: bash
