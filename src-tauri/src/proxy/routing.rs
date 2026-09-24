@@ -4,7 +4,7 @@
 //! virtual subnet routable; call `remove_routes` on shutdown to clean up. Every command is
 //! idempotent, so running it repeatedly never fails.
 //!
-//! - Windows: netsh (the wintun adapter needs an explicit IP)
+//! - Windows: IP Helper API (netsh is a silent no-op under LocalSystem; kept as fallback)
 //! - Linux:   ip addr / ip link / ip route (the kernel adds the connected route itself;
 //!   an explicit `replace` acts as a fallback)
 //! - macOS:   ifconfig / route (utun interfaces need an explicit IP and route)
@@ -156,6 +156,31 @@ fn configure_interface_windows(interface: &str) -> Result<()> {
     for base in TUN_BASE_CANDIDATES {
         let ip = Ipv4Addr::from(u32::from(base) | 0x0000_00FE).to_string();
 
+        // A block that overlaps a subnet an existing adapter already sits in is unusable:
+        // the connected route for it would exist on both interfaces and packets for the
+        // TUN address (e.g. DNS to …254:53) would be ARP-resolved on the physical LAN,
+        // where nothing answers. This is not hypothetical — 10.0.0.0/24, the first
+        // candidate, is also what a great many home LANs (including this dev machine's)
+        // use. Checking upfront costs one GetAdaptersAddresses call and skips the whole
+        // DAD wait on a block that could never work.
+        match tun_block_collides(base, interface) {
+            Ok(true) => {
+                tracing::warn!(
+                    "Skipping TUN block {}/24: it overlaps a subnet already in use on this host",
+                    base
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    "Could not check whether {}/24 collides with existing subnets: {}; trying it anyway",
+                    base,
+                    e
+                );
+            }
+        }
+
         // The address is set through the IP Helper API, not `netsh`: as a service
         // (LocalSystem) netsh exits 0 with no output and no effect, which is what made the
         // TUN address unbindable on every block. `netsh` is kept as a fallback for the cases
@@ -291,6 +316,91 @@ fn bindable(ip: &str) -> std::io::Result<()> {
     // address really is attached to a local interface; failure (usually WSAEADDRNOTAVAIL,
     // 10049) means it is not ready yet.
     UdpSocket::bind((ip, 0)).map(|_| ())
+}
+
+/// True when some adapter other than the TUN one already has a unicast IPv4 address whose
+/// subnet overlaps `base`/24. Such a block cannot be used for the TUN: its connected route
+/// would exist on both interfaces and traffic for the TUN address would escape onto the
+/// physical LAN.
+#[cfg(windows)]
+fn tun_block_collides(base: Ipv4Addr, tun_interface: &str) -> Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR_IN};
+
+    // IfOperStatusUp — down adapters keep stale DHCP addresses that route nothing.
+    const IF_OPER_STATUS_UP: i32 = 1;
+
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut size: u32 = 16 * 1024;
+    for _ in 0..4 {
+        // IP_ADAPTER_ADDRESSES_LH starts with a ULONGLONG, so keep the buffer 8-aligned.
+        let mut buf: Vec<u64> = vec![0; size.div_ceil(8) as usize];
+        let rc = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                flags,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        };
+        if rc == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if rc != 0 {
+            anyhow::bail!("GetAdaptersAddresses failed: {rc}");
+        }
+        let mut cur: *const IP_ADAPTER_ADDRESSES_LH = buf.as_ptr().cast();
+        while !cur.is_null() {
+            let adapter: &IP_ADAPTER_ADDRESSES_LH = unsafe { &*cur };
+            let name = if adapter.FriendlyName.is_null() {
+                String::new()
+            } else {
+                unsafe { wide_ptr_to_string(adapter.FriendlyName) }
+            };
+            if name != tun_interface && adapter.OperStatus == IF_OPER_STATUS_UP {
+                let mut uni = adapter.FirstUnicastAddress;
+                while !uni.is_null() {
+                    let u = unsafe { &*uni };
+                    if !u.Address.lpSockaddr.is_null()
+                        && unsafe { (*u.Address.lpSockaddr).sa_family } == AF_INET
+                    {
+                        let sin: *const SOCKADDR_IN = u.Address.lpSockaddr.cast();
+                        // Same union-view trick as unicast_row: the dword view does not
+                        // depend on how IN_ADDR's union is spelled.
+                        let raw = unsafe {
+                            std::ptr::read_unaligned(&(*sin).sin_addr as *const _ as *const u32)
+                        };
+                        let addr = Ipv4Addr::from(u32::from_be(raw));
+                        // Overlap against the *wider* of the two subnets: a /8 LAN contains
+                        // the whole candidate /24, a /32 host route only its own address.
+                        let prefix = u.OnLinkPrefixLength.min(24);
+                        if prefix > 0 {
+                            let mask = u32::MAX << (32 - prefix);
+                            if (u32::from(base) & mask) == (u32::from(addr) & mask) {
+                                tracing::warn!(
+                                    "TUN block {}/24 overlaps {}/{} on adapter {:?}",
+                                    base,
+                                    addr,
+                                    u.OnLinkPrefixLength,
+                                    name
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    }
+                    uni = u.Next;
+                }
+            }
+            cur = adapter.Next;
+        }
+        return Ok(false);
+    }
+    anyhow::bail!("GetAdaptersAddresses kept asking for a larger buffer");
 }
 
 /// Assigns `ip/24` to `interface` through the IP Helper API.

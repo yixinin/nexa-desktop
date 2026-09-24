@@ -115,7 +115,13 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
         };
         let controls_accepted = match state {
             ServiceState::StopPending | ServiceState::Stopped => ServiceControlAccept::empty(),
-            _ => ServiceControlAccept::STOP,
+            // SHUTDOWN/PRESHUTDOWN matter for the TUN's DNS hijack: without them the SCM
+            // kills the process at machine shutdown without any control event, the teardown
+            // never runs, and the static DNS entries it left behind (they survive a reboot)
+            // break name resolution for the whole machine on the next boot.
+            _ => ServiceControlAccept::STOP
+                | ServiceControlAccept::SHUTDOWN
+                | ServiceControlAccept::PRESHUTDOWN,
         };
         handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -156,7 +162,10 @@ fn start_windows_service() -> Result<(), Box<dyn std::error::Error>> {
 
         let event_handler = move |control_event| -> ServiceControlHandlerResult {
             match control_event {
-                ServiceControl::Stop | ServiceControl::Shutdown => {
+                // PRESHUTDOWN is the early warning a service that asked for it gets; the
+                // teardown (TUN down + system-DNS restore) is exactly the slow work it
+                // exists for, so it is handled the same way as the shutdown itself.
+                ServiceControl::Stop | ServiceControl::Shutdown | ServiceControl::Preshutdown => {
                     tracing::info!("Stop requested");
                     let _ = stop_tx.send(true);
                     ServiceControlHandlerResult::NoError

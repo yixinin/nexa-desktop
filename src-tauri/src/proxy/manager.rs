@@ -189,9 +189,13 @@ impl ProxyInstance {
     async fn stop(self) {
         tracing::info!("Stopping proxy instance");
 
-        // The local DNS server is owned by tun_proxy::run and cleaned up when TUN stops
+        // The local DNS server and the system-DNS restore are owned by tun_proxy::run, and
+        // they only happen when that task winds down — so wait for the teardown instead of
+        // just flagging it. A service stop drops the whole tokio runtime right after this
+        // returns; without the wait the restore never runs and the machine keeps a static
+        // DNS pointing at a TUN address that no longer exists.
         if let Some(tun_proxy) = self.tun_proxy {
-            tun_proxy.stop();
+            tun_proxy.stop_and_wait().await;
         }
 
         if let Some(local_proxy) = self.local_proxy {

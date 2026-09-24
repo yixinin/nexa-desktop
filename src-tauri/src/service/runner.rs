@@ -46,6 +46,13 @@ impl ServiceRunner {
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Service runner starting");
 
+        // A hijack whose process died mid-run (killed, or a machine shutdown that reached
+        // the service before its teardown finished) leaves static DNS entries that survive
+        // the reboot: the machine comes back with no working name resolution — including
+        // for this service itself, whose iroh endpoint cannot even publish to pkarr.
+        // Clean that up before anything here needs DNS.
+        crate::proxy::dns_config::cleanup_stale_hijack();
+
         let listener = TcpListener::bind(IPC_SOCKET_PATH)
             .await
             .context("Failed to bind IPC socket")?;

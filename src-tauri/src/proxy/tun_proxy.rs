@@ -156,6 +156,10 @@ pub struct TunProxy {
     connections: Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
     identification: Arc<Mutex<u16>>,
     stopped: Arc<AtomicBool>,
+    /// `true` once `run()` has fully wound down — including the system-DNS restore.
+    /// Starts `true` (nothing is running); `run()` flips it to `false` on entry and a drop
+    /// guard flips it back on the way out, whichever path `run()` returned by.
+    teardown_done: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl TunProxy {
@@ -171,12 +175,44 @@ impl TunProxy {
             connections: Arc::new(Mutex::new(HashMap::new())),
             identification: Arc::new(Mutex::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
+            teardown_done: Arc::new(tokio::sync::watch::channel(true).0),
         }
     }
 
     pub fn stop(&self) {
         tracing::info!("Stopping TUN proxy");
         self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Sets the stop flag and waits until `run()` has finished its cleanup — which is what
+    /// restores the system DNS. A bare flag-set lets the caller's process exit (a service
+    /// stop is followed by the runtime being dropped) or report "stopped" to the UI while
+    /// the restore has not run yet, leaving the machine with a static DNS pointing at a
+    /// TUN address that no longer exists — "the internet is broken" until something resets
+    /// it. Bounded, so a stuck teardown cannot wedge the caller either.
+    pub async fn stop_and_wait(&self) {
+        self.stop();
+        let mut rx = self.teardown_done.subscribe();
+        let done = async {
+            loop {
+                if *rx.borrow_and_update() {
+                    break;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        // run_device notices the flag within one read poll; the restore itself is two
+        // PowerShell spawns, a couple of seconds at worst. Twenty seconds is generous.
+        if tokio::time::timeout(std::time::Duration::from_secs(20), done)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "TUN teardown did not finish within 20s; the system DNS restore may not have run"
+            );
+        }
     }
 
     /// Whether the current process may create a TUN device (Windows: admin / Unix: root)
@@ -209,6 +245,12 @@ impl TunProxy {
     /// started — otherwise Windows fails the bind with WSAEADDRNOTAVAIL (10049).
     pub async fn run(&self) -> Result<()> {
         tracing::info!("Starting TUN proxy with DNS hijacking");
+
+        // Marks the tunnel as not-torn-down for `stop_and_wait`; the guard flips it back
+        // when `run()` returns by any path — success, an early `?` bail, or a panic — so a
+        // waiter never hangs on a run that died before its cleanup.
+        let _ = self.teardown_done.send(false);
+        let _teardown = TeardownGuard(self.teardown_done.clone());
 
         let device = Arc::new(self.create_device()?);
         let interface = device.tun_name()?;
@@ -252,12 +294,38 @@ impl TunProxy {
                 tun_ip()
             )
         })?;
+        let dns_server = Arc::new(dns_server);
         let dns_stopped = dns_server.stopped_flag();
+        let dns_v4 = dns_server.clone();
         let dns_handle = tokio::spawn(async move {
-            if let Err(e) = dns_server.run_with_socket(dns_socket).await {
+            if let Err(e) = dns_v4.run_with_socket(dns_socket).await {
                 tracing::error!("DNS server failed: {}", e);
             }
         });
+
+        // The same server also listens on the IPv6 loopback: the hijack points every
+        // physical adapter's static IPv6 DNS at ::1 (see dns_config). Without this, a
+        // router-learned fe80::... v6 DNS races the TUN resolver and wins with an
+        // NXDOMAIN for proxied domains (they do not exist publicly) — the observed
+        // "proxy connects but the domain does not resolve" failure.
+        let dns_v6_handle = match tokio::net::UdpSocket::bind("[::1]:53").await {
+            Ok(sock) => {
+                tracing::info!("DNS server also listening on: [::1]:53");
+                let dns_v6 = dns_server.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = dns_v6.run_with_socket(Arc::new(sock)).await {
+                        tracing::error!("DNS server (v6 loopback) failed: {}", e);
+                    }
+                }))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not bind DNS server on [::1]:53: {} — a router-learned IPv6 DNS may win the resolution race",
+                    e
+                );
+                None
+            }
+        };
 
         // 3. Point system DNS at the virtual IP — only after the DNS server bound successfully
         if let Err(e) = dns_config::set_system_dns(&interface, &dns_ip) {
@@ -273,6 +341,11 @@ impl TunProxy {
         dns_stopped.store(true, Ordering::Release);
         if let Err(e) = dns_handle.await {
             tracing::debug!("DNS handle join error: {:?}", e);
+        }
+        if let Some(h) = dns_v6_handle {
+            if let Err(e) = h.await {
+                tracing::debug!("DNS v6 handle join error: {:?}", e);
+            }
         }
         if let Err(e) = routing::remove_routes(&interface) {
             tracing::warn!("Failed to remove TUN routes: {}", e);
@@ -370,6 +443,15 @@ struct TunCtx<'a> {
     connections: &'a Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
     endpoint_group: &'a Arc<EndpointGroup>,
     identification: &'a Arc<Mutex<u16>>,
+}
+
+/// Signals `teardown_done` when `run()` returns, by whatever path it took.
+struct TeardownGuard(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Drop for TeardownGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(true);
+    }
 }
 
 /// Arguments of [`spawn_recv_task`].
