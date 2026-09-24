@@ -1,0 +1,14 @@
+#!/bin/sh
+# Keep an already-running nexa-service on the old binary until the new one is unpacked.
+set -e
+
+SERVICE=nexa-service.service
+STATE_FILE=/run/nexa-service.was-active
+
+rm -f "$STATE_FILE"
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$SERVICE"; then
+    : > "$STATE_FILE"
+    systemctl stop "$SERVICE" || true
+fi
+
+exit 0
