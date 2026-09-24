@@ -1,4 +1,4 @@
-use crate::proxy::dns::{DnsServerConfig, IpMapping};
+use crate::proxy::dns::DnsServerConfig;
 use crate::proxy::local_proxy::LocalProxyWrapper;
 use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, TUN_IP};
 use anyhow::Result;
@@ -210,7 +210,6 @@ impl ProxyInstance {
 
 pub struct ProxyManager {
     config: ProxyManagerConfig,
-    ip_mapping: Arc<IpMapping>,
     mode: parking_lot::Mutex<Option<ProxyMode>>,
     instance: parking_lot::Mutex<Option<ProxyInstance>>,
 }
@@ -219,7 +218,6 @@ impl ProxyManager {
     pub fn new(config: ProxyManagerConfig) -> Self {
         Self {
             config,
-            ip_mapping: Arc::new(IpMapping::new()),
             mode: parking_lot::Mutex::new(None),
             instance: parking_lot::Mutex::new(None),
         }
@@ -314,16 +312,22 @@ impl ProxyManager {
             .transport_config(transport_tuning.transport_config())
             .relay_mode(relay.relay_mode());
 
-        let iroh_endpoint = ep_builder.bind().await
+        let iroh_endpoint = ep_builder
+            .bind()
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to bind iroh endpoint: {}", e))?;
         tracing::info!("Iroh endpoint bound, node_id={}", iroh_endpoint.id());
         // Taken before the endpoint is handed to the group, which owns it from here on.
         let local_node_id = iroh_endpoint.id().to_string();
 
-        let endpoint_group =
-            EndpointGroup::new_with_nodes_and_endpoint(nodes.clone(), None, self.config.load_balancing.into(), iroh_endpoint)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+        let endpoint_group = EndpointGroup::new_with_nodes_and_endpoint(
+            nodes.clone(),
+            None,
+            self.config.load_balancing.into(),
+            iroh_endpoint,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
         // 2FA is per endpoint, applied after the group exists because that is when each node has
         // been resolved to the backend ID its pool is keyed by. A node with no credentials keeps
@@ -364,7 +368,9 @@ impl ProxyManager {
                 TotpAlgorithm::from_name(&two_factor.algorithm),
             )
             .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?;
-            endpoint_group.set_two_factor_for(&addr.id.to_string(), Some(auth)).await;
+            endpoint_group
+                .set_two_factor_for(&addr.id.to_string(), Some(auth))
+                .await;
             tracing::info!(
                 "2FA enabled for {}, client_id: {}",
                 addr.id,
@@ -446,11 +452,7 @@ impl ProxyManager {
                     proxy_domains: all_domains.clone(),
                 },
             };
-            let tun_proxy = Arc::new(TunProxy::new(
-                tun_config,
-                endpoint_group.clone(),
-                self.ip_mapping.clone(),
-            ));
+            let tun_proxy = Arc::new(TunProxy::new(tun_config, endpoint_group.clone()));
 
             *self.instance.lock() = Some(ProxyInstance {
                 tun_proxy: Some(tun_proxy.clone()),
@@ -536,7 +538,10 @@ impl ProxyManager {
     pub async fn get_node_id(&self) -> Option<String> {
         // Cloned out of the lock before anything else: a parking_lot guard must not be held
         // across a suspension point.
-        self.instance.lock().as_ref().map(|i| i.local_node_id.clone())
+        self.instance
+            .lock()
+            .as_ref()
+            .map(|i| i.local_node_id.clone())
     }
 
     /// How each configured node currently reaches its backend: direct, or through a relay.

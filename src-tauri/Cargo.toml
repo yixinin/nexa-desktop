@@ -45,6 +45,7 @@ tun = { version = "0.7", features = ["async"] }
 libc = "0.2"
 nexapipe-client = { path = "../../crates/nexapipe-client", features = [
     "local-proxy",
+    "tun-proxy",
 ] }
 
 [target.'cfg(windows)'.dependencies]

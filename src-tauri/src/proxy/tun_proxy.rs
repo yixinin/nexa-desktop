@@ -1,40 +1,51 @@
-﻿//! TUN proxy — cross-platform implementation
-//! (Windows: wintun / Linux: /dev/net/tun / macOS: utun).
+//! TUN proxy — desktop side: owns the TUN device, the interface/route/system-DNS
+//! configuration and the local DNS sockets.
 //!
-//! Data flow:
+//! The TCP/IP stack itself is NOT implemented here any more: the hand-written
+//! packet-level TCP state machine (no MSS segmentation, a fixed 65535 window,
+//! one iroh connection per TCP flow, never returned to the pool) was replaced by
+//! the netstack-smoltcp core in `nexapipe-client`'s `tun_proxy` — the same code
+//! the Android client runs. This module feeds the device's IP packets into that
+//! stack and back:
+//!
 //! ```text
-//! APP → TUN device → AsyncDevice::recv() → parse IP/TCP packet
-//!                                            ↓
-//!                    look up the domain by destination virtual IP (IpMapping)
-//!                                            ↓
-//!              open an iroh bi-stream, write the L4 preface (host + port),
-//!              wait for the server's status byte — a refusal becomes a RST
-//!                                            ↓
-//!                 build TCP reply packet → AsyncDevice::send() → TUN device → APP
+//! APP → TUN device → shared TunProxy (netstack-smoltcp)
+//!                      ├─ TCP: reverse-lookup the destination virtual IP
+//!                      │        → l4::open_tcp(domain, port) → iroh → server route
+//!                      │        (pooled connections, returned after the flow ends)
+//!                      ├─ UDP: one l4::open_udp bi-stream per flow
+//!                      └─ DNS (dst <dns_ip>:53): hijack, one virtual IP per domain
+//!
+//! DNS has two entry points on the desktop, sharing one IpMapping so an address
+//! handed out by either is routable by the stack:
+//!   - queries that traverse the TUN device reach the stack's UDP demultiplexer;
+//!   - queries the OS local-delivers (Windows never sends packets to the
+//!     machine's own address through the adapter) reach the DnsServer bound on
+//!     the interface address — see `run`.
 //! ```
 //!
-//! Virtual network (must stay in sync with the IpMapping allocation in dns.rs):
-//! - 10.0.0.254  = TUN device address / DNS server address
-//! - 10.0.0.2+   = virtual IPs mapped to proxied domains (returned by DNS hijacking)
+//! Virtual network (must stay in sync with the pool in `run` and the DNS answers
+//! in dns.rs):
+//! - x.x.x.254  = TUN device address / DNS server address (the block in use)
+//! - x.x.x.2 … x.x.x.253 = virtual IPs mapped to proxied domains
 //!
-//! System routing: once the interface is configured as 10.0.0.254/24 the kernel adds a
-//! 10.0.0.0/24 connected route automatically, so all traffic to the virtual IPs enters the
-//! TUN device; system DNS points at 10.0.0.254 (see dns_config.rs).
+//! System routing: once the interface is configured as x.x.x.254/24 the kernel
+//! adds a x.x.x.0/24 connected route automatically, so all traffic to the
+//! virtual IPs enters the TUN device; system DNS points at x.x.x.254 (see
+//! dns_config.rs, which also parks the physical adapters' IPv6 DNS on [::1]).
 //!
 //! Platform differences:
 //! - Windows: the tun crate creates a wintun adapter; wintun.dll must be loaded first
 //! - Linux:   the tun crate creates a /dev/net/tun device; any name works (≤15 chars)
 //! - macOS:   the name must be utunN; if omitted the system assigns one automatically
 
-use crate::proxy::dns::{DnsServer, DnsServerConfig, IpMapping};
-use crate::proxy::packet::{tcp_flags, Ipv4Packet, TcpPacket, IPPROTO_TCP};
+use crate::proxy::dns::{DnsServer, DnsServerConfig};
 use crate::proxy::{dns_config, routing};
 use anyhow::Result;
 use nexapipe_client::endpoint_group::EndpointGroup;
-use nexapipe_client::l4::{self, L4Proto};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use nexapipe_client::tun_proxy::{TunProxy as StackProxy, TunStackConfig};
+use nexapipe_client::virtual_ip::IpMapping;
+use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,37 +119,15 @@ pub fn retarget(addr: &str) -> String {
 /// derived automatically from the interface address.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const TUN_NETWORK: &str = "10.0.0.0/24";
-/// Must match `TUN_MTU` in `crates/nexapipe-client/src/tun_proxy.rs` and `tunMtu` in
-/// `ui-android/.../NexaVpnService.kt`. 1400 keeps one inner IP packet inside a single QUIC
-/// datagram (~1435 usable bytes after the short header + AEAD tag); at 1500 every inner
-/// segment was split across two datagrams, roughly doubling the packet count and AEAD cost.
+/// Must match `TUN_MTU` in `crates/nexapipe-client/src/tun_proxy.rs` (the smoltcp stack is
+/// built with it) and `tunMtu` in `ui-android/.../NexaVpnService.kt`. 1400 keeps one inner IP
+/// packet inside a single QUIC datagram (~1435 usable bytes after the short header + AEAD tag);
+/// at 1500 every inner segment was split across two datagrams, roughly doubling the packet
+/// count and AEAD cost.
 const TUN_MTU: usize = 1400;
-/// Read loop timeout — lets the loop react to stop() in a timely fashion
+/// Wait-loop poll interval — lets `run()` react to stop() (and to the stack dying on its own)
+/// in a timely fashion.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(100);
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum TcpState {
-    SynReceived,
-    Established,
-    FinWait1,
-    LastAck,
-}
-
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct ConnectionKey {
-    src_ip: u32,
-    src_port: u16,
-    dst_ip: u32,
-    dst_port: u16,
-}
-
-struct Connection {
-    state: TcpState,
-    our_seq: u32,
-    our_ack: u32,
-    nexapipe_send: Option<iroh::endpoint::SendStream>,
-    nexapipe_recv: Option<iroh::endpoint::RecvStream>,
-}
 
 #[derive(Debug, Clone)]
 pub struct TunProxyConfig {
@@ -152,9 +141,6 @@ pub struct TunProxyConfig {
 pub struct TunProxy {
     config: TunProxyConfig,
     endpoint_group: Arc<EndpointGroup>,
-    ip_mapping: Arc<IpMapping>,
-    connections: Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
-    identification: Arc<Mutex<u16>>,
     stopped: Arc<AtomicBool>,
     /// `true` once `run()` has fully wound down — including the system-DNS restore.
     /// Starts `true` (nothing is running); `run()` flips it to `false` on entry and a drop
@@ -163,17 +149,10 @@ pub struct TunProxy {
 }
 
 impl TunProxy {
-    pub fn new(
-        config: TunProxyConfig,
-        endpoint_group: Arc<EndpointGroup>,
-        ip_mapping: Arc<IpMapping>,
-    ) -> Self {
+    pub fn new(config: TunProxyConfig, endpoint_group: Arc<EndpointGroup>) -> Self {
         Self {
             config,
             endpoint_group,
-            ip_mapping,
-            connections: Arc::new(Mutex::new(HashMap::new())),
-            identification: Arc::new(Mutex::new(0)),
             stopped: Arc::new(AtomicBool::new(false)),
             teardown_done: Arc::new(tokio::sync::watch::channel(true).0),
         }
@@ -203,8 +182,9 @@ impl TunProxy {
                 }
             }
         };
-        // run_device notices the flag within one read poll; the restore itself is two
-        // PowerShell spawns, a couple of seconds at worst. Twenty seconds is generous.
+        // The wait loop notices the flag within one poll; the stack shutdown joins its
+        // tasks (500 ms each), and the restore itself is two PowerShell spawns. Twenty
+        // seconds is generous.
         if tokio::time::timeout(std::time::Duration::from_secs(20), done)
             .await
             .is_err()
@@ -238,13 +218,13 @@ impl TunProxy {
     }
 
     /// Starts the TUN proxy: create device → configure address/routes → start local DNS
-    /// → switch system DNS → run the packet loop → clean up and restore.
+    /// → switch system DNS → run the smoltcp stack over the device → clean up and restore.
     ///
-    /// The order matters: the local DNS server must bind to 10.0.0.254:53, which is the TUN
+    /// The order matters: the local DNS server must bind to x.x.x.254:53, which is the TUN
     /// interface address, so the interface has to be configured before the DNS server is
     /// started — otherwise Windows fails the bind with WSAEADDRNOTAVAIL (10049).
     pub async fn run(&self) -> Result<()> {
-        tracing::info!("Starting TUN proxy with DNS hijacking");
+        tracing::info!("Starting TUN proxy (smoltcp stack) with DNS hijacking");
 
         // Marks the tunnel as not-torn-down for `stop_and_wait`; the guard flips it back
         // when `run()` returns by any path — success, an early `?` bail, or a panic — so a
@@ -252,7 +232,7 @@ impl TunProxy {
         let _ = self.teardown_done.send(false);
         let _teardown = TeardownGuard(self.teardown_done.clone());
 
-        let device = Arc::new(self.create_device()?);
+        let device = self.create_device()?;
         let interface = device.tun_name()?;
         tracing::info!(
             "TUN device ready: {} (mtu {})",
@@ -265,7 +245,17 @@ impl TunProxy {
         routing::configure_interface(&interface)?;
         routing::add_routes(&interface)?;
 
-        // 2. Bind the local DNS server (DNS hijacking).
+        // 2. One IpMapping for everything: the DNS server's answers and the stack's
+        //    reverse lookups must agree, or a domain resolved through [::1] would hand
+        //    out an address the stack refuses to route. The pool leaves …254 (the
+        //    interface/DNS address) to the interface, exactly like the old dns.rs pool.
+        let base = tun_base();
+        let ip_mapping = Arc::new(IpMapping::with_range(
+            Ipv4Addr::from(u32::from(base) | 0x02),
+            Ipv4Addr::from(u32::from(base) | 0xFD),
+        ));
+
+        // 3. Bind the local DNS server (DNS hijacking).
         //    The bind must succeed before system DNS is pointed at the TUN address, otherwise
         //    system DNS would point at an address nobody listens on and break DNS for the
         //    entire machine (including iroh relay resolution).
@@ -283,7 +273,7 @@ impl TunProxy {
                 upstream_dns: self.config.dns.upstream_dns.clone(),
                 proxy_domains: self.config.dns.proxy_domains.clone(),
             },
-            self.ip_mapping.clone(),
+            ip_mapping.clone(),
         );
         let dns_socket = dns_server.bind().await.map_err(|e| {
             anyhow::anyhow!(
@@ -327,14 +317,80 @@ impl TunProxy {
             }
         };
 
-        // 3. Point system DNS at the virtual IP — only after the DNS server bound successfully
+        // 4. Point system DNS at the virtual IP — only after the DNS server bound successfully
         if let Err(e) = dns_config::set_system_dns(&interface, &dns_ip) {
             tracing::warn!("Failed to set system DNS: {}, DNS hijack may not work", e);
         }
 
-        let result = self.run_device(&device).await;
+        // 5. Start the smoltcp stack over the device. Each AsyncRead/AsyncWrite call
+        //    on the device carries exactly one IP packet; the stack demultiplexes TCP
+        //    flows (per-domain virtual IP → l4::open_tcp, connections pooled and
+        //    returned), UDP flows and the DNS queries that do traverse the TUN.
+        let dns_ip_v4: Ipv4Addr = retarget(&self.config.dns_ip)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid DNS IP '{}': {}", self.config.dns_ip, e))?;
+        // The stack's own DNS branch forwards through the same upstream + fallback
+        // chain as the local DNS server (see dns.rs).
+        let mut dns_servers: Vec<SocketAddr> = Vec::new();
+        for upstream in std::iter::once(self.config.dns.upstream_dns.as_str())
+            .chain(crate::proxy::dns::FALLBACK_UPSTREAMS.iter().copied())
+        {
+            if let Ok(addr) = upstream.parse::<SocketAddr>() {
+                if !dns_servers.contains(&addr) {
+                    dns_servers.push(addr);
+                }
+            }
+        }
+        let (reader, writer) = tokio::io::split(device);
+        let stack = StackProxy::with_io(
+            reader,
+            writer,
+            self.endpoint_group.clone(),
+            self.config.dns.proxy_domains.clone(),
+            dns_servers,
+            TunStackConfig {
+                dns_ip: dns_ip_v4,
+                // The desktop never handed out a fixed proxy address, so there is no
+                // legacy payload-sniffing path — every flow goes by its own virtual IP.
+                legacy_proxy_ip: None,
+                ip_mapping,
+            },
+        );
 
-        // Cleanup (best effort): restore system DNS, stop the local DNS server, remove routes
+        let mut stack = match stack {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // Fall through to the cleanup below (system DNS restore &c.) with the error.
+                tracing::error!("Failed to start the TUN stack: {}", e);
+                None
+            }
+        };
+        let run_result: Result<()> = match &stack {
+            Some(_) => {
+                // 6. Run until stopped. The stack's own stop flag is set by every one of
+                //    its tasks on exit, so a dead device tears the whole proxy down.
+                loop {
+                    if self.stopped.load(Ordering::Acquire) {
+                        tracing::info!("TUN stopping due to stop flag");
+                        break;
+                    }
+                    if stack.as_ref().is_some_and(|s| s.is_stopped()) {
+                        tracing::warn!("TUN stack stopped on its own, winding down");
+                        break;
+                    }
+                    tokio::time::sleep(READ_POLL_TIMEOUT).await;
+                }
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(
+                "Failed to start the smoltcp TUN stack (see the log above)"
+            )),
+        };
+
+        // Cleanup (best effort), in the order the parts were brought up: restore
+        // system DNS, stop the local DNS server, remove the routes — all while the
+        // device (still held by the stack's pumps) keeps the interface alive — and
+        // only then stop the stack, which drops the device and the adapter.
         if let Err(e) = dns_config::restore_system_dns(&interface, &dns_ip) {
             tracing::warn!("Failed to restore system DNS: {}", e);
         }
@@ -350,7 +406,10 @@ impl TunProxy {
         if let Err(e) = routing::remove_routes(&interface) {
             tracing::warn!("Failed to remove TUN routes: {}", e);
         }
-        result
+        if let Some(s) = stack.take() {
+            s.shutdown_async().await;
+        }
+        run_result
     }
 
     /// Creates the TUN device. On Windows this first locates wintun.dll and passes it to the
@@ -386,63 +445,6 @@ impl TunProxy {
         let device = tun::create_as_async(&config)?;
         Ok(device)
     }
-
-    /// Runs the packet loop: read from TUN → parse → dispatch to handle_packet.
-    async fn run_device(&self, device: &Arc<tun::AsyncDevice>) -> Result<()> {
-        let mut buf = vec![0u8; TUN_MTU];
-        loop {
-            if self.stopped.load(Ordering::Acquire) {
-                tracing::info!("TUN stopping due to stop flag");
-                break;
-            }
-            match tokio::time::timeout(READ_POLL_TIMEOUT, device.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
-                    if n == 0 {
-                        break;
-                    }
-                    let data = buf[..n].to_vec();
-                    let device = device.clone();
-                    let connections = self.connections.clone();
-                    let endpoint_group = self.endpoint_group.clone();
-                    let ip_mapping = self.ip_mapping.clone();
-                    let identification = self.identification.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_packet(
-                            &data,
-                            &device,
-                            &connections,
-                            &endpoint_group,
-                            &ip_mapping,
-                            &identification,
-                        )
-                        .await
-                        {
-                            tracing::debug!("Packet handling error: {}", e);
-                        }
-                    });
-                }
-                Ok(Err(e)) => {
-                    tracing::error!("TUN receive error: {}", e);
-                    break;
-                }
-                Err(_) => continue, // Timed out; loop back to check the stop flag
-            }
-        }
-        tracing::info!("TUN proxy stopped");
-        Ok(())
-    }
-}
-
-/// Everything a TCP handler needs that is *not* per-packet: the TUN device, the
-/// connection table, the endpoint group and the IP-id counter.
-///
-/// Grouped because `handle_tcp` and `handle_syn` always took these four together,
-/// which put both of them over clippy's argument limit.
-struct TunCtx<'a> {
-    device: &'a Arc<tun::AsyncDevice>,
-    connections: &'a Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
-    endpoint_group: &'a Arc<EndpointGroup>,
-    identification: &'a Arc<Mutex<u16>>,
 }
 
 /// Signals `teardown_done` when `run()` returns, by whatever path it took.
@@ -452,394 +454,6 @@ impl Drop for TeardownGuard {
     fn drop(&mut self) {
         let _ = self.0.send(true);
     }
-}
-
-/// Arguments of [`spawn_recv_task`].
-///
-/// Owned rather than borrowed because the task it spawns is `'static`: it outlives
-/// the packet handler that created it, so it cannot borrow from it.
-struct RecvTask {
-    conn_key: ConnectionKey,
-    connections: Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
-    tun_ip: Ipv4Addr,
-    client_ip: Ipv4Addr,
-    tun_port: u16,
-    client_port: u16,
-    identification: Arc<Mutex<u16>>,
-    device: Arc<tun::AsyncDevice>,
-    initial_seq: u32,
-    initial_ack: u32,
-}
-
-async fn handle_packet(
-    data: &[u8],
-    device: &Arc<tun::AsyncDevice>,
-    connections: &Arc<Mutex<HashMap<ConnectionKey, Connection>>>,
-    endpoint_group: &Arc<EndpointGroup>,
-    ip_mapping: &Arc<IpMapping>,
-    identification: &Arc<Mutex<u16>>,
-) -> Result<()> {
-    let ip_packet = match Ipv4Packet::parse(data) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    if ip_packet.protocol != IPPROTO_TCP {
-        return Ok(());
-    }
-    let tcp_packet = match TcpPacket::parse(&ip_packet.payload) {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-    let domain = match ip_mapping.lookup_domain(&ip_packet.dst_addr) {
-        Some(d) => d,
-        None => return Ok(()),
-    };
-    let conn_key = ConnectionKey {
-        src_ip: u32::from(ip_packet.src_addr),
-        src_port: tcp_packet.src_port,
-        dst_ip: u32::from(ip_packet.dst_addr),
-        dst_port: tcp_packet.dst_port,
-    };
-    let ctx = TunCtx {
-        device,
-        connections,
-        endpoint_group,
-        identification,
-    };
-    handle_tcp(&conn_key, &tcp_packet, &ip_packet, &domain, ctx).await
-}
-
-async fn handle_tcp(
-    conn_key: &ConnectionKey,
-    tcp: &TcpPacket,
-    ip: &Ipv4Packet,
-    domain: &str,
-    ctx: TunCtx<'_>,
-) -> Result<()> {
-    let is_syn = (tcp.flags & tcp_flags::SYN) != 0;
-    let is_ack = (tcp.flags & tcp_flags::ACK) != 0;
-    let is_fin = (tcp.flags & tcp_flags::FIN) != 0;
-    let is_rst = (tcp.flags & tcp_flags::RST) != 0;
-    let has_data = !tcp.payload.is_empty();
-
-    if is_rst {
-        ctx.connections.lock().remove(conn_key);
-        return Ok(());
-    }
-
-    if is_syn && !is_ack {
-        return handle_syn(conn_key, tcp, ip, domain, ctx).await;
-    }
-
-    let conn_exists = ctx.connections.lock().contains_key(conn_key);
-    if !conn_exists {
-        return Ok(());
-    }
-
-    let conn_state = {
-        let conns = ctx.connections.lock();
-        conns.get(conn_key).map(|c| (c.state, c.our_seq, c.our_ack))
-    };
-    let (state, our_seq, _our_ack) = match conn_state {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-
-    match state {
-        TcpState::SynReceived => {
-            if is_ack && !has_data {
-                let mut conns = ctx.connections.lock();
-                if let Some(conn) = conns.get_mut(conn_key) {
-                    conn.state = TcpState::Established;
-                }
-            }
-        }
-        TcpState::Established => {
-            if has_data {
-                let mut send_stream = {
-                    let mut conns = ctx.connections.lock();
-                    conns.get_mut(conn_key).and_then(|c| c.nexapipe_send.take())
-                };
-                if let Some(ref mut send) = send_stream {
-                    if let Err(_e) = send.write_all(&tcp.payload).await {
-                        ctx.connections.lock().remove(conn_key);
-                        return Ok(());
-                    }
-                }
-                {
-                    let mut conns = ctx.connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) {
-                        conn.nexapipe_send = send_stream;
-                    }
-                }
-                let new_ack = tcp.seq_num.wrapping_add(tcp.payload.len() as u32);
-                let ack_packet = TcpPacket {
-                    src_port: tcp.dst_port,
-                    dst_port: tcp.src_port,
-                    seq_num: our_seq,
-                    ack_num: new_ack,
-                    flags: tcp_flags::ACK,
-                    window: 65535,
-                    payload: Vec::new(),
-                };
-                let id = get_next_id(ctx.identification);
-                let packet = ack_packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-                send_tun_packet(ctx.device, &packet).await?;
-                {
-                    let mut conns = ctx.connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) {
-                        conn.our_ack = new_ack;
-                    }
-                }
-                spawn_recv_task(RecvTask {
-                    conn_key: *conn_key,
-                    connections: ctx.connections.clone(),
-                    tun_ip: ip.dst_addr,
-                    client_ip: ip.src_addr,
-                    tun_port: tcp.dst_port,
-                    client_port: tcp.src_port,
-                    identification: ctx.identification.clone(),
-                    device: ctx.device.clone(),
-                    initial_seq: our_seq,
-                    initial_ack: new_ack,
-                });
-            }
-            if is_fin {
-                let fin_ack = tcp.seq_num.wrapping_add(tcp.payload.len() as u32 + 1);
-                let packet = TcpPacket {
-                    src_port: tcp.dst_port,
-                    dst_port: tcp.src_port,
-                    seq_num: our_seq,
-                    ack_num: fin_ack,
-                    flags: tcp_flags::FIN | tcp_flags::ACK,
-                    window: 65535,
-                    payload: Vec::new(),
-                };
-                let id = get_next_id(ctx.identification);
-                let data = packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-                send_tun_packet(ctx.device, &data).await?;
-                {
-                    let mut conns = ctx.connections.lock();
-                    if let Some(conn) = conns.get_mut(conn_key) {
-                        conn.state = TcpState::LastAck;
-                        conn.our_ack = fin_ack;
-                    }
-                }
-            }
-        }
-        TcpState::LastAck if is_ack => {
-            ctx.connections.lock().remove(conn_key);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-async fn handle_syn(
-    conn_key: &ConnectionKey,
-    tcp: &TcpPacket,
-    ip: &Ipv4Packet,
-    domain: &str,
-    ctx: TunCtx<'_>,
-) -> Result<()> {
-    // A retransmitted SYN while this handshake is still in flight must not open a
-    // second tunnel: the preface round trip below can outlast the application's SYN
-    // retransmit timer, and the second flow would leave the first one orphaned on the
-    // server. Answer the retransmission with the SYN-ACK that was already promised.
-    let pending = {
-        let conns = ctx.connections.lock();
-        conns.get(conn_key).map(|c| (c.state, c.our_seq))
-    };
-    if let Some((state, our_seq)) = pending {
-        if matches!(state, TcpState::SynReceived) {
-            let syn_ack = TcpPacket {
-                src_port: tcp.dst_port,
-                dst_port: tcp.src_port,
-                seq_num: our_seq.wrapping_sub(1),
-                ack_num: tcp.seq_num.wrapping_add(1),
-                flags: tcp_flags::SYN | tcp_flags::ACK,
-                window: 65535,
-                payload: Vec::new(),
-            };
-            let id = get_next_id(ctx.identification);
-            send_tun_packet(
-                ctx.device,
-                &syn_ack.build_with_ip(ip.dst_addr, ip.src_addr, id),
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-
-    let pooled_conn = match ctx.endpoint_group.get_connection(domain).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to get nexapipe connection: {}", e);
-            return send_rst(ctx.device, tcp, ip, ctx.identification).await;
-        }
-    };
-
-    let conn = pooled_conn.into_inner();
-
-    let (mut send, mut recv) = match conn.open_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            tracing::error!("Failed to open nexapipe stream: {}", e);
-            return send_rst(ctx.device, tcp, ip, ctx.identification).await;
-        }
-    };
-
-    // Announce where this connection is going with the L4 preface, and wait for the
-    // server to say whether it can carry it.
-    //
-    // This used to write `CONNECT <domain>:<port> HTTP/1.1` as the first bytes of the
-    // bi-stream. Nothing on the server understood that: the bytes went into the HTTP
-    // parser, came out with an empty path, matched no route and were forwarded to
-    // `default_backend`. The port was thrown away, so only 443 ever worked — and a
-    // refusal looked exactly like success. `l4::handshake` is the same code the local
-    // proxy's CONNECT branch uses, so the two paths cannot drift apart on the wire
-    // format.
-    if let Err(e) = l4::handshake(&mut send, &mut recv, L4Proto::Tcp, domain, tcp.dst_port).await {
-        tracing::warn!("Cannot open a TCP tunnel to {}:{}: {}", domain, tcp.dst_port, e);
-        return send_rst(ctx.device, tcp, ip, ctx.identification).await;
-    }
-
-    let our_seq = 1000u32;
-    let our_ack = tcp.seq_num.wrapping_add(1);
-    let syn_ack = TcpPacket {
-        src_port: tcp.dst_port,
-        dst_port: tcp.src_port,
-        seq_num: our_seq,
-        ack_num: our_ack,
-        flags: tcp_flags::SYN | tcp_flags::ACK,
-        window: 65535,
-        payload: Vec::new(),
-    };
-    let id = get_next_id(ctx.identification);
-    let data = syn_ack.build_with_ip(ip.dst_addr, ip.src_addr, id);
-    send_tun_packet(ctx.device, &data).await?;
-
-    let conn_data = Connection {
-        state: TcpState::SynReceived,
-        our_seq: our_seq.wrapping_add(1),
-        our_ack,
-        nexapipe_send: Some(send),
-        nexapipe_recv: Some(recv),
-    };
-    ctx.connections.lock().insert(*conn_key, conn_data);
-    Ok(())
-}
-
-fn spawn_recv_task(task: RecvTask) {
-    let RecvTask {
-        conn_key,
-        connections,
-        tun_ip,
-        client_ip,
-        tun_port,
-        client_port,
-        identification,
-        device,
-        initial_seq,
-        initial_ack,
-    } = task;
-
-    let recv = {
-        let mut conns = connections.lock();
-        match conns.get_mut(&conn_key) {
-            Some(conn) => conn.nexapipe_recv.take(),
-            None => return,
-        }
-    };
-    if recv.is_none() {
-        return;
-    }
-    let mut recv = recv.unwrap();
-    let mut our_seq = initial_seq;
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(None) => break,
-                Ok(Some(n)) => {
-                    let data = &buf[..n];
-                    let tcp_packet = TcpPacket {
-                        src_port: tun_port,
-                        dst_port: client_port,
-                        seq_num: our_seq,
-                        ack_num: initial_ack,
-                        flags: tcp_flags::PSH | tcp_flags::ACK,
-                        window: 65535,
-                        payload: data.to_vec(),
-                    };
-                    let id = get_next_id(&identification);
-                    let packet = tcp_packet.build_with_ip(tun_ip, client_ip, id);
-                    if let Err(_e) = send_tun_packet(&device, &packet).await {
-                        break;
-                    }
-                    our_seq = our_seq.wrapping_add(n as u32);
-                }
-                Err(_e) => break,
-            }
-        }
-        let fin_packet = TcpPacket {
-            src_port: tun_port,
-            dst_port: client_port,
-            seq_num: our_seq,
-            ack_num: initial_ack,
-            flags: tcp_flags::FIN | tcp_flags::ACK,
-            window: 65535,
-            payload: Vec::new(),
-        };
-        let id = get_next_id(&identification);
-        let packet = fin_packet.build_with_ip(tun_ip, client_ip, id);
-        let _ = send_tun_packet(&device, &packet).await;
-        let mut conns = connections.lock();
-        if let Some(conn) = conns.get_mut(&conn_key) {
-            conn.state = TcpState::FinWait1;
-        }
-    });
-}
-
-async fn send_tun_packet(device: &Arc<tun::AsyncDevice>, data: &[u8]) -> Result<()> {
-    device
-        .send(data)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to send TUN packet: {}", e))?;
-    Ok(())
-}
-
-/// Refuse a connection the proxy cannot carry.
-///
-/// The application is waiting for a SYN-ACK, so without this it keeps waiting until
-/// its own connect timeout — the RST is what makes it fail now, and what tells it the
-/// proxy (rather than a silent black hole) declined.
-async fn send_rst(
-    device: &Arc<tun::AsyncDevice>,
-    tcp: &TcpPacket,
-    ip: &Ipv4Packet,
-    identification: &Arc<Mutex<u16>>,
-) -> Result<()> {
-    let rst_packet = TcpPacket {
-        src_port: tcp.dst_port,
-        dst_port: tcp.src_port,
-        seq_num: 0,
-        ack_num: tcp.seq_num.wrapping_add(1),
-        flags: tcp_flags::RST | tcp_flags::ACK,
-        window: 0,
-        payload: Vec::new(),
-    };
-    let id = get_next_id(identification);
-    let data = rst_packet.build_with_ip(ip.dst_addr, ip.src_addr, id);
-    send_tun_packet(device, &data).await
-}
-
-fn get_next_id(identification: &Arc<Mutex<u16>>) -> u16 {
-    let mut id = identification.lock();
-    let current = *id;
-    *id = id.wrapping_add(1);
-    current
 }
 
 /// Windows: locate the absolute path of wintun.dll (lookup only, no loading).

@@ -1,74 +1,14 @@
-﻿use anyhow::Result;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use anyhow::Result;
 use std::net::Ipv4Addr;
 
-use crate::proxy::tun_proxy::tun_base;
+// The per-domain virtual IP mapping is the same one the smoltcp stack routes by
+// (nexapipe-client's): an address this server hands out must be an address the
+// stack can reverse-lookup, so both share one instance and one pool.
+pub use nexapipe_client::virtual_ip::IpMapping;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-
-/// Host part of the first and last virtual IP handed out to a proxied domain (…2 … …253).
-///
-/// Deliberately not absolute addresses: the block the TUN lands on is only known once the
-/// interface is up (see `tun_proxy::tun_base`), so the base is applied at allocation time.
-const VIRTUAL_IP_FIRST_HOST: u32 = 0x02;
-const VIRTUAL_IP_LAST_HOST: u32 = 0xFD;
-
-/// IP -> domain mapping table
-#[derive(Debug)]
-pub struct IpMapping {
-    ip_to_domain: Mutex<HashMap<u32, String>>,
-    domain_to_ip: Mutex<HashMap<String, u32>>,
-    next_host: Mutex<u32>,
-}
-
-impl IpMapping {
-    pub fn new() -> Self {
-        Self {
-            ip_to_domain: Mutex::new(HashMap::new()),
-            domain_to_ip: Mutex::new(HashMap::new()),
-            next_host: Mutex::new(VIRTUAL_IP_FIRST_HOST),
-        }
-    }
-
-    /// Allocates a virtual IP for a domain (returns the existing one if already allocated)
-    pub fn allocate(&self, domain: &str) -> Ipv4Addr {
-        let domain_lower = domain.to_lowercase();
-
-        // Reuse the existing allocation if there is one
-        {
-            let domain_to_ip = self.domain_to_ip.lock();
-            if let Some(&ip) = domain_to_ip.get(&domain_lower) {
-                return Ipv4Addr::from(ip);
-            }
-        }
-
-        // Allocate a new IP. Only the host part is remembered: the block the TUN ended up on is
-        // not known when this mapping is created (it is chosen once the interface is up), so an
-        // absolute address frozen here could belong to a block nobody routes.
-        let mut next_host = self.next_host.lock();
-        let ip = u32::from(tun_base()) | *next_host;
-
-        // Wrap around once the range is exhausted
-        if *next_host >= VIRTUAL_IP_LAST_HOST {
-            *next_host = VIRTUAL_IP_FIRST_HOST;
-        } else {
-            *next_host += 1;
-        }
-
-        self.ip_to_domain.lock().insert(ip, domain_lower.clone());
-        self.domain_to_ip.lock().insert(domain_lower, ip);
-
-        Ipv4Addr::from(ip)
-    }
-
-    /// Looks up the domain an IP is mapped to
-    pub fn lookup_domain(&self, ip: &Ipv4Addr) -> Option<String> {
-        let ip_u32 = u32::from(*ip);
-        self.ip_to_domain.lock().get(&ip_u32).cloned()
-    }
-}
 
 /// DNS server configuration
 #[derive(Debug, Clone)]
@@ -215,7 +155,7 @@ async fn handle_dns_query(
 /// The default 8.8.8.8 is unreachable on some networks (e.g. direct connections in mainland
 /// China), which breaks iroh relay resolution ("No addressing information available"), so we
 /// fall back through public resolvers that are reachable there.
-const FALLBACK_UPSTREAMS: &[&str] = &[
+pub(crate) const FALLBACK_UPSTREAMS: &[&str] = &[
     "223.5.5.5:53",       // AliDNS
     "114.114.114.114:53", // 114 DNS
     "1.1.1.1:53",         // Cloudflare
