@@ -597,7 +597,37 @@ unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
 /// block has been given a fair chance the TUN moves to the next one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn configure_interface_unix(interface: &str) -> Result<()> {
+    // Addresses other interfaces already hold. A candidate block containing one is not ours to
+    // take, and bindability probing cannot see it: the address is bindable, it is just spoken
+    // for. The classic case is a coexisting fake-IP VPN — Clash/mihomo &co default to a
+    // 198.18.0.1/16 fake-IP pool — whose DNS hands out addresses across the range while its own
+    // interface only holds a sliver. Our /24 route is more specific than its catch-all routes,
+    // so every fake IP it handed out inside our block lands in our TUN with no domain mapping
+    // and is dropped, which looks exactly like "the rest of the internet died".
+    let foreign = foreign_interface_addresses(interface);
+    // Fake-IP tools treat 198.18.0.0/15 as one pool (the RFC 2544 convention) even though the
+    // two candidates here are separate /24s: a foreign address anywhere in the /15 disqualifies
+    // both, because the tool's DNS may hand out any address in the range.
+    let fake_ip_claimed = foreign
+        .iter()
+        .any(|a| matches!(a.octets(), [198, 18..=19, _, _]));
+
     for base in TUN_BASE_CANDIDATES {
+        if matches!(base.octets(), [198, 18 | 19, 0, 0]) && fake_ip_claimed {
+            tracing::warn!(
+                "skipping {base}/24: another interface holds an address in 198.18.0.0/15 — \
+                 a fake-IP VPN (Clash/mihomo &co) owns that range"
+            );
+            continue;
+        }
+        if foreign
+            .iter()
+            .any(|a| u32::from(*a) & 0xFFFF_FF00 == u32::from(base))
+        {
+            tracing::warn!("skipping {base}/24: another interface already holds an address in it");
+            continue;
+        }
+
         let ip = Ipv4Addr::from(u32::from(base) | 0x0000_00FE);
 
         if let Err(e) = assign_interface_address(interface, &ip) {
@@ -633,6 +663,86 @@ fn configure_interface_unix(interface: &str) -> Result<()> {
         interface,
         TUN_BASE_CANDIDATES
     )
+}
+
+/// IPv4 addresses held by interfaces other than `skip`.
+///
+/// An enumeration failure yields an empty list — the bindability probe still guards the basic
+/// "can this address exist here" question; this check only adds the "is it already spoken for"
+/// one on top.
+#[cfg(target_os = "macos")]
+fn foreign_interface_addresses(skip: &str) -> Vec<Ipv4Addr> {
+    match Command::new("ifconfig").arg("-a").output() {
+        Ok(output) => parse_ifconfig_addresses(&String::from_utf8_lossy(&output.stdout), skip),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// IPv4 addresses held by interfaces other than `skip`. See the macOS twin for the rationale.
+#[cfg(target_os = "linux")]
+fn foreign_interface_addresses(skip: &str) -> Vec<Ipv4Addr> {
+    match Command::new("ip")
+        .args(["-o", "-4", "addr", "show"])
+        .output()
+    {
+        Ok(output) => parse_ip_addr_addresses(&String::from_utf8_lossy(&output.stdout), skip),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// `ifconfig -a` address lines: an unindented line names the interface, a tab-indented
+/// `inet <addr> ...` line under it carries one of its addresses (`inet6` lines are excluded by
+/// the trailing space in the prefix).
+#[cfg(target_os = "macos")]
+fn parse_ifconfig_addresses(text: &str, skip: &str) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut current = "";
+    for line in text.lines() {
+        if line.starts_with('\t') || line.starts_with(' ') {
+            if let Some(addr) = line
+                .trim_start()
+                .strip_prefix("inet ")
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|a| a.parse().ok())
+            {
+                if current != skip {
+                    out.push(addr);
+                }
+            }
+        } else if let Some(name) = line.split(':').next() {
+            current = name.trim();
+        }
+    }
+    out
+}
+
+/// `ip -o -4 addr show` lines: `<idx>: <ifname>[@<peer>] inet <addr>/<prefix> ...`.
+#[cfg(target_os = "linux")]
+fn parse_ip_addr_addresses(text: &str, skip: &str) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next().is_none() {
+            continue;
+        }
+        let Some(ifname) = fields.next().map(|n| n.split('@').next().unwrap_or(n)) else {
+            continue;
+        };
+        if fields.next() != Some("inet") {
+            continue;
+        }
+        let Some(addr) = fields
+            .next()
+            .and_then(|a| a.split('/').next())
+            .and_then(|a| a.parse().ok())
+        else {
+            continue;
+        };
+        if ifname != skip {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// Whether `ip` can be bound within a short grace period — the same test the DNS server has to
@@ -715,4 +825,50 @@ fn remove_interface_address(interface: &str, ip: &Ipv4Addr) {
     let _ = Command::new("ifconfig")
         .args([interface, "inet", &ip.to_string(), "remove"])
         .output();
+}
+
+#[cfg(test)]
+mod tests {
+    /// The conflict the candidate-block check exists for: a fake-IP VPN (Clash/mihomo) holds
+    /// 198.18.0.1/30 on its utun while our default candidate block is 198.18.0.0/24.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_foreign_address_inside_a_candidate_block_is_collected() {
+        let text = "\
+lo0: flags=8049<LOOPBACK,RUNNING,MULTICAST> mtu 16384
+\tinet 127.0.0.1 netmask 0xff000000
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+\tinet 10.0.0.83 netmask 0xffffff00 broadcast 10.0.0.255
+\tinet6 fe80::1%en0 prefixlen 64 scopeid 0x4
+utun8: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 9000
+\tinet 198.18.0.1 --> 198.18.0.1 netmask 0xfffffffc
+\tinet6 fe80::c62:9049:5746:8c61%utun8 prefixlen 64 scopeid 0x17
+nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
+\tinet 198.18.0.254 netmask 0xffffff00
+";
+        let foreign = super::parse_ifconfig_addresses(text, "nexa-tun");
+        assert!(foreign.contains(&"198.18.0.1".parse().unwrap()));
+        assert!(foreign.contains(&"10.0.0.83".parse().unwrap()));
+        // Our own interface is excluded, and inet6 lines are not addresses here.
+        assert!(!foreign.contains(&"198.18.0.254".parse().unwrap()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_foreign_address_inside_a_candidate_block_is_collected() {
+        let text = "\
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
+    inet 127.0.0.1/8 scope host lo
+2: enp3s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0
+9: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 9000
+    inet 198.18.0.1/30 scope global tun0
+10: nexa-tun: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400
+    inet 198.18.0.254/24 scope global nexa-tun
+";
+        let foreign = super::parse_ip_addr_addresses(text, "nexa-tun");
+        assert!(foreign.contains(&"198.18.0.1".parse().unwrap()));
+        assert!(foreign.contains(&"10.0.0.83".parse().unwrap()));
+        assert!(!foreign.contains(&"198.18.0.254".parse().unwrap()));
+    }
 }

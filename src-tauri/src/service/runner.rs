@@ -442,10 +442,16 @@ impl ServiceRunner {
         // the next start with it.
         *startup_error_slot().write().await = None;
 
-        let pm = proxy_manager.write().await;
+        let mut pm = proxy_manager.write().await;
         if let Some(manager) = pm.as_ref() {
             manager.stop().await;
         }
+        // Clear the registration as well as stopping the instance. `stop()` sets the mode back
+        // to `None`, and a manager that is still registered with no mode reads as "starting" —
+        // after a deliberate stop nothing is starting. Same rationale as the desktop's own stop
+        // path; without this, a stop followed by a UI restart left every status poll answering
+        // `starting` forever.
+        *pm = None;
         IpcResponse::Ok
     }
 

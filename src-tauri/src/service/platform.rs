@@ -1046,14 +1046,21 @@ fn uninstall_service_macos() -> Result<(), AppError> {
 fn is_service_running_macos() -> bool {
     use std::process::Command;
 
-    Command::new("launchctl")
-        .args(["list", format!("com.nexa.{}", SERVICE_NAME).as_str()])
+    // The daemon lives in the *system* domain, but a plain `launchctl list <label>` from a user
+    // session queries the user's GUI domain and answers "Could not find service" (exit 1) even
+    // while the daemon is running — which had the service panel show "stopped" forever.
+    // `launchctl print system/<label>` is readable without root and names the state outright.
+    let label = format!("com.nexa.{}", SERVICE_NAME);
+    let Ok(output) = Command::new("launchctl")
+        .args(["print", format!("system/{label}").as_str()])
         .output()
-        .map(|output| {
-            output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).contains("Could not find service")
-        })
-        .unwrap_or(false)
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "state = running")
 }
 
 /// The plist is the registration: no file means the service was never installed.
