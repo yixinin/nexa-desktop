@@ -16,34 +16,33 @@ use std::process::Command;
 use crate::proxy::tun_proxy::{TUN_BASE_CANDIDATES, TUN_NETMASK, set_tun_base, tun_network};
 #[cfg(windows)]
 use std::net::Ipv4Addr;
-#[cfg(target_os = "macos")]
-use crate::proxy::tun_proxy::{TUN_IP, TUN_NETMASK};
-#[cfg(target_os = "linux")]
-use crate::proxy::tun_proxy::{TUN_IP, TUN_NETWORK};
 #[cfg(windows)]
 use std::net::UdpSocket;
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::proxy::tun_proxy::{set_tun_base, tun_network, TUN_BASE_CANDIDATES, TUN_NETMASK};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::net::{Ipv4Addr, UdpSocket};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::time::{Duration, Instant};
+
 /// Assigns the TUN interface IP address and brings the interface up (idempotent).
+///
+/// Every platform follows the same policy: walk [`TUN_BASE_CANDIDATES`] and keep the first
+/// block whose address actually becomes bindable, recording it via `set_tun_base` so the rest
+/// of the proxy (DNS address, virtual IP pool) derives from the block in use.
 pub fn configure_interface(interface: &str) -> Result<()> {
     #[cfg(windows)]
-    {
-        configure_interface_windows(interface)
-    }
+    return configure_interface_windows(interface);
 
-    #[cfg(target_os = "linux")]
-    {
-        configure_interface_linux(interface)
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        configure_interface_macos(interface)
-    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return configure_interface_unix(interface);
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     {
+        let _ = interface;
         Ok(())
     }
 }
@@ -54,7 +53,7 @@ pub fn configure_interface(interface: &str) -> Result<()> {
 pub fn add_routes(interface: &str) -> Result<()> {
     #[cfg(windows)]
     {
-        // `netsh set address` already added the 10.0.0.0/24 connected route
+        // Setting the interface address already added the /24 connected route
         let _ = interface;
         Ok(())
     }
@@ -62,7 +61,7 @@ pub fn add_routes(interface: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let output = Command::new("ip")
-            .args(["route", "replace", TUN_NETWORK, "dev", interface])
+            .args(["route", "replace", &tun_network(), "dev", interface])
             .output()
             .map_err(|e| anyhow::anyhow!("Failed to run ip route: {}", e))?;
         if !output.status.success() {
@@ -75,12 +74,16 @@ pub fn add_routes(interface: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         // Returns "File exists" when the route is already present — treat that as success
+        let network = tun_network();
+        let (network, _) = network
+            .split_once('/')
+            .expect("tun_network() is a CIDR block");
         let output = Command::new("route")
             .args([
                 "-n",
                 "add",
                 "-net",
-                "10.0.0.0",
+                network,
                 "-netmask",
                 TUN_NETMASK,
                 "-interface",
@@ -115,19 +118,23 @@ pub fn remove_routes(interface: &str) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let _ = Command::new("ip")
-            .args(["route", "del", TUN_NETWORK, "dev", interface])
+            .args(["route", "del", &tun_network(), "dev", interface])
             .output();
         Ok(())
     }
 
     #[cfg(target_os = "macos")]
     {
+        let network = tun_network();
+        let (network, _) = network
+            .split_once('/')
+            .expect("tun_network() is a CIDR block");
         let _ = Command::new("route")
             .args([
                 "-n",
                 "delete",
                 "-net",
-                "10.0.0.0",
+                network,
                 "-netmask",
                 TUN_NETMASK,
                 "-interface",
@@ -576,17 +583,81 @@ unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
     String::from_utf16_lossy(slice)
 }
 
+// ==========================================================================
+// Unix — same candidate-block policy as Windows (see configure_interface_windows):
+// the address assignment is platform-specific (`ip` vs `ifconfig`), but the loop
+// that walks TUN_BASE_CANDIDATES and keeps the first bindable block is shared.
+// ==========================================================================
+
+/// Walks [`TUN_BASE_CANDIDATES`] and configures the first block the host actually accepts.
+///
+/// The historical behaviour assigned a fixed block, which is a liability: when the machine's
+/// own LAN uses the same one, the commands succeed but the address is never usable and every
+/// connection dies a couple of seconds in. Retrying the same address cannot help, so once a
+/// block has been given a fair chance the TUN moves to the next one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn configure_interface_unix(interface: &str) -> Result<()> {
+    for base in TUN_BASE_CANDIDATES {
+        let ip = Ipv4Addr::from(u32::from(base) | 0x0000_00FE);
+
+        if let Err(e) = assign_interface_address(interface, &ip) {
+            tracing::warn!("could not set {ip} on {interface}: {e}; trying the next block");
+            continue;
+        }
+
+        if wait_bindable(&ip) {
+            set_tun_base(base);
+            if base != TUN_BASE_CANDIDATES[0] {
+                tracing::warn!(
+                    "Moved the TUN to {}: an earlier candidate block was unusable on this host",
+                    tun_network()
+                );
+            }
+            tracing::info!(
+                "Interface {} configured with {} netmask {}",
+                interface,
+                ip,
+                TUN_NETMASK
+            );
+            return Ok(());
+        }
+
+        tracing::warn!(
+            "{ip} never became bindable on {interface}; removing it and trying the next block"
+        );
+        remove_interface_address(interface, &ip);
+    }
+
+    anyhow::bail!(
+        "Failed to give interface {} any of the candidate TUN blocks ({:?})",
+        interface,
+        TUN_BASE_CANDIDATES
+    )
+}
+
+/// Whether `ip` can be bound within a short grace period — the same test the DNS server has to
+/// pass before it starts. Windows needs this window for duplicate address detection; on Unix
+/// the address is normally usable immediately, so this is a short safety net only.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_bindable(ip: &Ipv4Addr) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if UdpSocket::bind((*ip, 0)).is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn configure_interface_linux(interface: &str) -> Result<()> {
+fn assign_interface_address(interface: &str, ip: &Ipv4Addr) -> Result<()> {
     // `ip addr replace` is idempotent — setting the same address twice does not fail
+    let cidr = format!("{ip}/24");
     let output = Command::new("ip")
-        .args([
-            "addr",
-            "replace",
-            &format!("{}/24", TUN_IP),
-            "dev",
-            interface,
-        ])
+        .args(["addr", "replace", &cidr, "dev", interface])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run ip addr: {}", e))?;
     if !output.status.success() {
@@ -605,12 +676,22 @@ fn configure_interface_linux(interface: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn remove_interface_address(interface: &str, ip: &Ipv4Addr) {
+    let cidr = format!("{ip}/24");
+    let _ = Command::new("ip")
+        .args(["addr", "del", &cidr, "dev", interface])
+        .output();
+}
+
 #[cfg(target_os = "macos")]
-fn configure_interface_macos(interface: &str) -> Result<()> {
-    // ifconfig utunX inet 10.0.0.254 255.255.255.0 — running it again replaces the existing
-    // address (idempotent)
+fn assign_interface_address(interface: &str, ip: &Ipv4Addr) -> Result<()> {
+    // ifconfig utunX inet <ip> <netmask> — running it again replaces the existing address
+    // (idempotent). utun interfaces are point-to-point by nature; the explicit /24 route in
+    // `add_routes` is what makes the whole block reachable, so this only has to make the
+    // address exist and be bindable.
     let output = Command::new("ifconfig")
-        .args([interface, "inet", TUN_IP, TUN_NETMASK])
+        .args([interface, "inet", &ip.to_string(), TUN_NETMASK])
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to run ifconfig: {}", e))?;
     if !output.status.success() {
@@ -627,4 +708,11 @@ fn configure_interface_macos(interface: &str) -> Result<()> {
         anyhow::bail!("ifconfig up failed: {}", stderr.trim());
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn remove_interface_address(interface: &str, ip: &Ipv4Addr) {
+    let _ = Command::new("ifconfig")
+        .args([interface, "inet", &ip.to_string(), "remove"])
+        .output();
 }

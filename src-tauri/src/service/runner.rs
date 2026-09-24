@@ -1,5 +1,5 @@
 ﻿use crate::error::{codes, AppError};
-use crate::proxy::tun_proxy::TUN_NETWORK;
+use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
 use crate::proxy::{
     ConnectionConfig, ProxyLoadBalancingStrategy, ProxyManager, ProxyManagerConfig, ProxyNodeConfig,
     StartError,
@@ -58,6 +58,15 @@ impl ServiceRunner {
             .context("Failed to bind IPC socket")?;
 
         tracing::info!("IPC server listening on: {}", IPC_SOCKET_PATH);
+
+        // Where this process will look for the token, printed once. A service that refuses every
+        // call because it cannot find one is otherwise indistinguishable from a service that is
+        // not there at all: the refusal names no path, and the desktop can only report that the
+        // connection closed. One line here turns that dead end into a diffable list.
+        tracing::info!(
+            "IPC token candidates: {:?}",
+            crate::service::ipc_token::service_token_paths()
+        );
 
         loop {
             let (mut stream, _) = listener
@@ -367,7 +376,7 @@ impl ServiceRunner {
             return IpcResponse::Error(e);
         }
 
-        let dns_addr = dns_addr.unwrap_or_else(|| "10.0.0.254:53".to_string());
+        let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
         if let Err(e) = require_tun_subnet(&dns_addr) {
             return IpcResponse::Error(e);
         }
@@ -534,15 +543,14 @@ fn require_loopback(addr: &str, code: &str) -> Result<(), AppError> {
     }
 }
 
-/// Refuses `addr` unless it is inside the TUN network the DNS server answers on.
+/// Refuses `addr` unless it is inside one of the candidate TUN blocks the DNS server can
+/// answer on.
+///
+/// The block actually in use is only decided when the TUN interface comes up
+/// (`routing::configure_interface` walks [`TUN_BASE_CANDIDATES`]), which is *after* this
+/// validation runs — so an address inside any candidate block is accepted, and `retarget`
+/// later moves it into the block that took. See `proxy::tun_proxy` for the block policy.
 fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
-    let (network, mask) = tun_network().ok_or_else(|| {
-        AppError::with_detail(
-            codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
-            format!("cannot interpret {TUN_NETWORK:?} as a network"),
-        )
-    })?;
-
     let parsed = addr.parse::<SocketAddr>().map_err(|e| {
         AppError::cause(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
@@ -550,34 +558,29 @@ fn require_tun_subnet(addr: &str) -> Result<(), AppError> {
         )
     })?;
 
+    // Every candidate is a /24, so the network part is everything but the last octet.
+    let in_candidate = |ip: &Ipv4Addr| {
+        TUN_BASE_CANDIDATES
+            .iter()
+            .any(|base| u32::from(*ip) & 0xFFFF_FF00 == u32::from(*base))
+    };
+
     match parsed.ip() {
-        IpAddr::V4(ip) if u32::from(ip) & mask == network => Ok(()),
+        IpAddr::V4(ip) if in_candidate(&ip) => Ok(()),
         other => Err(AppError::with_detail(
             codes::SERVICE_DNS_ADDR_OUTSIDE_TUN,
-            format!("{other} is outside {TUN_NETWORK}, where the TUN DNS server answers"),
+            format!(
+                "{other} is outside every candidate TUN block ({TUN_BASE_CANDIDATES:?}), \
+                 where the TUN DNS server answers"
+            ),
         )),
     }
 }
 
-/// The TUN network as `(network address, netmask)`, or `None` if
-/// [`TUN_NETWORK`] is not a plain IPv4 CIDR block.
-fn tun_network() -> Option<(u32, u32)> {
-    let (network, bits) = TUN_NETWORK.split_once('/')?;
-    let network: Ipv4Addr = network.parse().ok()?;
-    let bits: u32 = bits.parse().ok()?;
-    if bits > 32 {
-        return None;
-    }
-    // Shifting by the full width overflows, hence the explicit zero case.
-    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-    Some((u32::from(network) & mask, mask))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{IpcReadError, ServiceRunner, MAX_IPC_LINE, require_loopback, require_tun_subnet, tun_network};
+    use super::{IpcReadError, ServiceRunner, MAX_IPC_LINE, require_loopback, require_tun_subnet};
     use crate::error::codes;
-    use std::net::Ipv4Addr;
 
     /// A caller that has not authenticated yet must not be able to make this
     /// buffer grow, which is the whole reason the reader is capped.
@@ -665,18 +668,16 @@ mod tests {
 
     #[test]
     fn the_dns_server_stays_inside_the_tun_network() {
+        // The default block (198.18.0.0/24) and the legacy one (10.0.0.0/24) are both
+        // candidates — a config saved against the old default keeps working.
+        assert!(require_tun_subnet("198.18.0.254:53").is_ok());
         assert!(require_tun_subnet("10.0.0.254:53").is_ok());
         assert!(require_tun_subnet("10.0.0.1:53").is_ok());
+        assert!(require_tun_subnet("100.100.0.254:53").is_ok());
         assert!(require_tun_subnet("8.8.8.8:53").is_err());
         assert!(require_tun_subnet("127.0.0.1:53").is_err());
         assert!(require_tun_subnet("10.0.1.1:53").is_err());
+        assert!(require_tun_subnet("198.19.1.1:53").is_err());
         assert!(require_tun_subnet("[::1]:53").is_err());
-    }
-
-    #[test]
-    fn the_tun_network_parses_into_a_maskable_prefix() {
-        let (network, mask) = tun_network().expect("TUN_NETWORK is an IPv4 CIDR");
-        assert_eq!(mask, 0xFFFF_FF00);
-        assert_eq!(network, u32::from(Ipv4Addr::new(10, 0, 0, 0)));
     }
 }

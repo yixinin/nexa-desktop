@@ -35,12 +35,6 @@ const dnsAddr = ref(config.dnsAddr);
 const upstreamDns = ref(config.upstreamDns);
 const loadBalancing = ref<LoadBalancingStrategy>(config.loadBalancing);
 
-const nodeDomainsText = ref<Map<string, string>>(new Map());
-
-config.nodes.forEach(node => {
-  nodeDomainsText.value.set(node.id, node.domains.join("\n"));
-});
-
 /** Label and description are i18n keys, not literals — they are resolved where they render. */
 const loadBalancingOptions: { value: LoadBalancingStrategy; label: string; desc: string }[] = [
   { value: 'round_robin', label: 'config.strategyRoundRobin', desc: 'config.strategyRoundRobinDesc' },
@@ -116,12 +110,29 @@ function getNodeTypeColor(type: ConnectionType): string {
   return type === 'ticket' ? '#8b5cf6' : '#0ea5e9';
 }
 
-function getNodeDomainsText(nodeId: string): string {
-  return nodeDomainsText.value.get(nodeId) || "";
+/**
+ * Text for a node's domains box, derived from the store on every render.
+ *
+ * This used to be a `Map` snapshotted once during setup, seeded from the nodes that existed at
+ * that moment. A node created afterwards — every node an invite imports — therefore had no
+ * entry and rendered an *empty* box, while the count badge beside it printed the live
+ * `node.domains.length`: "5 个域名" above an empty field. Because that box is also the editor,
+ * the first keystroke then wrote the empty text back through `updateNodeDomainsText`, which is
+ * how an imported domain list could disappear for real rather than just look missing.
+ *
+ * Deriving it means the box can only ever show what the node actually holds, and an import that
+ * *merges* domains into an existing node is reflected too.
+ */
+function getNodeDomainsText(node: NodeConfig): string {
+  return node.domains.join("\n");
 }
 
+/**
+ * One line per domain; blank lines are ignored, so the field tolerates a pasted list with
+ * trailing newlines. The box is left as typed until the parsed result differs from what it
+ * renders — see `getNodeDomainsText` — which keeps the caret from jumping mid-line.
+ */
 function updateNodeDomainsText(nodeId: string, text: string) {
-  nodeDomainsText.value.set(nodeId, text);
   const domains = text
     .split("\n")
     .map(d => d.trim())
@@ -169,14 +180,14 @@ watch([localAddr, dnsAddr, upstreamDns, loadBalancing], handleUpdate);
 
 function loadExampleConfig() {
   localAddr.value = "127.0.0.1:8080";
-  dnsAddr.value = "10.0.0.1:53";
+  dnsAddr.value = "198.18.0.254:53";
   upstreamDns.value = "223.5.5.5:53";
   loadBalancing.value = "round_robin";
 }
 
 function clearConfig() {
   localAddr.value = "127.0.0.1:8080";
-  dnsAddr.value = "10.0.0.1:53";
+  dnsAddr.value = "198.18.0.254:53";
   upstreamDns.value = "223.5.5.5:53";
   loadBalancing.value = "round_robin";
 }
@@ -293,7 +304,7 @@ function clearConfig() {
                 </svg>
               </div>
               <textarea
-                :value="getNodeDomainsText(node.id)"
+                :value="getNodeDomainsText(node)"
                 @input="updateNodeDomainsText(node.id, ($event.target as HTMLTextAreaElement).value)"
                 rows="2"
                 :placeholder="t('config.domainsPlaceholder')"
@@ -430,7 +441,7 @@ function clearConfig() {
               id="dnsAddr"
               v-model="dnsAddr"
               type="text"
-              placeholder="10.0.0.1:53"
+              placeholder="198.18.0.254:53"
               class="form-input"
             />
           </div>

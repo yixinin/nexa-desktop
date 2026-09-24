@@ -48,7 +48,7 @@ const defaultConfig: ProxyConfig = {
   nodes: [],
   domains: [],
   localAddr: '127.0.0.1:8080',
-  dnsAddr: '10.0.0.254:53',
+  dnsAddr: '198.18.0.254:53',
   upstreamDns: '223.5.5.5:53',
   loadBalancing: 'round_robin',
   tunName: 'nexa-tun',

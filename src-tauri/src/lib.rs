@@ -256,7 +256,7 @@ async fn start_proxy(
         .map_err(|e: String| AppError::cause(codes::PROXY_INVALID_LOAD_BALANCING, e))?;
 
     let local_addr = local_addr.unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let dns_addr = dns_addr.unwrap_or_else(|| "10.0.0.254:53".to_string());
+    let dns_addr = dns_addr.unwrap_or_else(|| "198.18.0.254:53".to_string());
     let upstream_dns = upstream_dns.unwrap_or_else(|| "8.8.8.8:53".to_string());
 
     let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());

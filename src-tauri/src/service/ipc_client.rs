@@ -29,7 +29,18 @@ impl IpcClient {
         // The token is generated and owned by this side, so it — and only it —
         // can drive the service; see `service::ipc_token`.
         let token = crate::service::ipc_token::ensure_token()?;
-        Self::exchange(&mut stream, IpcMessage::Auth(token)).await?;
+
+        // The handshake's answer has to be read, not discarded. The service refuses it for
+        // exactly one reason it can name — nothing is published, or what was presented does not
+        // match — and closes the connection right after. Dropping that answer leaves the *next*
+        // write to fail on a socket the peer has already closed, which surfaces as "the service
+        // closed the connection without answering": the one message that says nothing about why,
+        // and the reason a missing token looked like a broken service.
+        match Self::exchange(&mut stream, IpcMessage::Auth(token)).await? {
+            IpcResponse::Ok => {}
+            IpcResponse::Error(e) => return Err(e),
+            other => return Err(unexpected(&other)),
+        }
 
         tracing::debug!("Authenticated, sending message");
         Self::exchange(&mut stream, msg).await

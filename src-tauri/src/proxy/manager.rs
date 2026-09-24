@@ -1,6 +1,6 @@
 use crate::proxy::dns::DnsServerConfig;
 use crate::proxy::local_proxy::LocalProxyWrapper;
-use crate::proxy::tun_proxy::{TunProxy, TunProxyConfig, TUN_IP};
+use crate::proxy::tun_proxy::{tun_ip, TunProxy, TunProxyConfig};
 use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -436,12 +436,16 @@ impl ProxyManager {
             // Starting the local DNS server and switching system DNS is handled inside
             // tun_proxy::run (DNS is started after the interface is configured to avoid
             // WSAEADDRNOTAVAIL); here we only build the configuration.
+            // The interface address is only decided when the TUN comes up (the block may have
+            // moved), so the fallback is the *currently configured* one; `tun_proxy::retarget`
+            // moves whatever lands here into the block actually in use.
+            let fallback_ip = tun_ip();
             let dns_ip = self
                 .config
                 .dns_listen_addr
                 .split(':')
                 .next()
-                .unwrap_or(TUN_IP)
+                .unwrap_or(&fallback_ip)
                 .to_string();
             let tun_config = TunProxyConfig {
                 tunnel_name: self.config.tun_name.clone(),

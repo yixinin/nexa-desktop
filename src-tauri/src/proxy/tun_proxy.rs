@@ -53,33 +53,34 @@ use std::sync::Arc;
 use std::time::Duration;
 use tun::AbstractDevice;
 
-/// IP of the TUN device itself (also the address of the local DNS server), as configured.
-pub const TUN_IP: &str = "10.0.0.254";
+/// Tried in order; the first one the host will actually let us use wins.
+///
+/// The head of the list deliberately lives in *reserved* ranges rather than ordinary private
+/// address space: the historical default `10.0.0.0/24` is also what a great many home LANs
+/// use, and a TUN block overlapping the LAN breaks routing in ways that look like "the
+/// internet died". `198.18.0.0/15` (RFC 2544 benchmarking) is never handed out by any router
+/// or DHCP server and is the established convention for fake-IP DNS answers — which is
+/// exactly what the virtual IPs below are. The old `10.0.0.0` block stays at the tail so
+/// configurations saved against it remain valid (and get retargeted into whichever block
+/// actually took, see [`retarget`]).
+pub const TUN_BASE_CANDIDATES: [Ipv4Addr; 6] = [
+    Ipv4Addr::new(198, 18, 0, 0), // RFC 2544 benchmarking — the fake-IP convention
+    Ipv4Addr::new(198, 19, 0, 0), // second half of the same /15
+    Ipv4Addr::new(100, 100, 0, 0), // RFC 6598 CGNAT shared space — never a LAN subnet
+    Ipv4Addr::new(172, 26, 0, 0), // private-space fallback, rarely used by routers
+    Ipv4Addr::new(10, 200, 0, 0), // private-space fallback
+    Ipv4Addr::new(10, 0, 0, 0),   // legacy default, kept last for old saved configs
+];
+
+/// Netmask of the TUN block — every candidate is a /24.
 pub const TUN_NETMASK: &str = "255.255.255.0";
 
-/// The /24 the TUN lives on, as a base address — `10.0.0.0` unless the interface could not be
-/// configured with it.
-///
-/// A fixed block is a liability: the moment the machine's own LAN uses the same one, `netsh`
-/// reports success but the TUN address never becomes bindable, the DNS server cannot start and
-/// every connection dies a couple of seconds in. `routing::configure_interface` therefore walks
-/// [`TUN_BASE_CANDIDATES`] and records what actually took; everything that has to agree with the
-/// interface — the TUN address, the DNS address, the virtual IPs in `dns.rs` — is derived from
-/// here instead of from the constant.
+/// The block actually in use, as recorded by `routing::configure_interface`.
 static TUN_BASE: std::sync::OnceLock<Ipv4Addr> = std::sync::OnceLock::new();
-
-/// Tried in order; the first one the host will actually let us use wins.
-pub const TUN_BASE_CANDIDATES: [Ipv4Addr; 5] = [
-    Ipv4Addr::new(10, 0, 0, 0),
-    Ipv4Addr::new(10, 44, 0, 0),
-    Ipv4Addr::new(10, 55, 0, 0),
-    Ipv4Addr::new(172, 29, 0, 0),
-    Ipv4Addr::new(198, 18, 7, 0),
-];
 
 /// The base of the block in use. Falls back to the configured one until the interface is up.
 pub fn tun_base() -> Ipv4Addr {
-    *TUN_BASE.get_or_init(|| Ipv4Addr::new(10, 0, 0, 0))
+    *TUN_BASE.get_or_init(|| TUN_BASE_CANDIDATES[0])
 }
 
 /// Records the block `routing::configure_interface` actually managed to configure.
@@ -97,28 +98,42 @@ pub fn tun_network() -> String {
     format!("{}/24", tun_base())
 }
 
-/// Rewrites an address that still points into the *configured* block (10.0.0.x) so it points
-/// into the one actually in use.
+/// Rewrites an address that still points into one of the *candidate* blocks (as it was
+/// configured, before the interface existed) so it points at the same host address inside the
+/// block actually in use.
 ///
 /// Needed because the DNS address reaches the TUN proxy as a configured string, decided before
-/// the interface exists and therefore before the block is known. Anything the user set to a
-/// different block is left alone.
+/// the interface exists and therefore before the block is known — a config saved against the
+/// old `10.0.0.x` default, for instance, keeps working after the TUN moved to `198.18.0.0/24`.
+/// Anything outside every candidate block is a user-chosen address and is left alone.
 pub fn retarget(addr: &str) -> String {
-    match addr.strip_prefix("10.0.0.") {
-        Some(rest) => {
-            let b = tun_base().octets();
-            format!("{}.{}.{}.{}", b[0], b[1], b[2], rest)
+    // Split an optional `:port` off first; a bare address is also accepted.
+    let (host, port) = match addr.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            (host, Some(port))
         }
-        None => addr.to_string(),
+        _ => (addr, None),
+    };
+
+    let Ok(ip) = host.parse::<Ipv4Addr>() else {
+        return addr.to_string();
+    };
+
+    let in_candidate = TUN_BASE_CANDIDATES
+        .iter()
+        // Every candidate is a /24, so the network part is everything but the last octet.
+        .any(|base| u32::from(ip) & 0xFFFF_FF00 == u32::from(*base));
+    if !in_candidate {
+        return addr.to_string();
+    }
+
+    let retargeted = Ipv4Addr::from(u32::from(tun_base()) | (u32::from(ip) & 0x0000_00FF));
+    match port {
+        Some(port) => format!("{retargeted}:{port}"),
+        None => retargeted.to_string(),
     }
 }
 
-/// Virtual subnet — the block the TUN is on (`10.0.0.0/24` until it has to move) and the range
-/// of host addresses inside it handed out to proxied domains.
-/// Only used by the Linux routing module; on other platforms the connected route is
-/// derived automatically from the interface address.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub const TUN_NETWORK: &str = "10.0.0.0/24";
 /// Must match `TUN_MTU` in `crates/nexapipe-client/src/tun_proxy.rs` (the smoltcp stack is
 /// built with it) and `tunMtu` in `ui-android/.../NexaVpnService.kt`. 1400 keeps one inner IP
 /// packet inside a single QUIC datagram (~1435 usable bytes after the short header + AEAD tag);
@@ -131,8 +146,10 @@ const READ_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 pub struct TunProxyConfig {
+    /// Ignored on macOS, where the system assigns the utunN name itself.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub tunnel_name: String,
-    /// Address that system DNS should point at (the TUN virtual IP, usually 10.0.0.254)
+    /// Address that system DNS should point at (the TUN virtual IP, usually 198.18.0.254)
     pub dns_ip: String,
     /// Local DNS server configuration (DNS hijacking)
     pub dns: DnsServerConfig,
@@ -240,8 +257,8 @@ impl TunProxy {
             device.mtu().unwrap_or(TUN_MTU as u16)
         );
 
-        // 1. Configure the interface address / routes (idempotent) — 10.0.0.254 must already
-        //    exist on this host
+        // 1. Configure the interface address / routes (idempotent) — the TUN address (see
+        //    `tun_ip()`) must already exist on this host
         routing::configure_interface(&interface)?;
         routing::add_routes(&interface)?;
 
@@ -519,5 +536,41 @@ fn target_arch_dir() -> &'static str {
     )))]
     {
         "amd64"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A configured address inside one candidate block is rewritten into the block actually in
+    /// use, host part and port preserved — this is what keeps an old config (saved against the
+    /// legacy 10.0.0.x default) working after the TUN moved.
+    ///
+    /// `TUN_BASE` is a `OnceLock`, i.e. set at most once per process, so the expectations are
+    /// derived from [`tun_base`] instead of assuming which block a test managed to register.
+    #[test]
+    fn retarget_moves_candidate_block_addresses_into_the_block_in_use() {
+        set_tun_base(TUN_BASE_CANDIDATES[0]);
+        let base = u32::from(tun_base());
+        let moved = Ipv4Addr::from(base | 0x0000_00FE);
+
+        // Pick a candidate block that is not the one in use (always exists: there are six).
+        let other = TUN_BASE_CANDIDATES
+            .iter()
+            .find(|candidate| u32::from(**candidate) != base)
+            .expect("more than one candidate block");
+        let source = Ipv4Addr::from(u32::from(*other) | 0x0000_00FE);
+
+        assert_eq!(retarget(&format!("{source}:53")), format!("{moved}:53"));
+        assert_eq!(retarget(&source.to_string()), moved.to_string());
+    }
+
+    /// A user-chosen address outside every candidate block is none of our business.
+    #[test]
+    fn retarget_leaves_foreign_addresses_alone() {
+        assert_eq!(retarget("192.168.1.10:53"), "192.168.1.10:53");
+        assert_eq!(retarget("[::1]:53"), "[::1]:53");
+        assert_eq!(retarget("not-an-address"), "not-an-address");
     }
 }

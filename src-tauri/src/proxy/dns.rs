@@ -43,8 +43,8 @@ impl DnsServer {
     /// The caller must confirm the bind succeeded before pointing system DNS at
     /// `listen_addr`, otherwise system DNS would point at an address nobody listens on and
     /// break name resolution for the entire machine (which also disconnects the iroh relay).
-    /// On Windows, if the TUN interface address (10.0.0.254) is not ready yet, this returns
-    /// WSAEADDRNOTAVAIL (10049).
+    /// On Windows, if the TUN interface address (see `tun_proxy::tun_ip()`) is not ready yet,
+    /// this returns WSAEADDRNOTAVAIL (10049).
     pub async fn bind(&self) -> Result<Arc<UdpSocket>> {
         let socket = Arc::new(UdpSocket::bind(&self.config.listen_addr).await?);
         tracing::info!("DNS server listening on: {}", self.config.listen_addr);
