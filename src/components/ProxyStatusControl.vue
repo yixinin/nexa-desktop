@@ -35,6 +35,7 @@ const {
   busy,
   startupError,
   serviceRunning,
+  serviceInstalled,
   endpointLinks,
   stale,
   canStart,
@@ -214,7 +215,7 @@ async function copyNodeId(): Promise<void> {
       </div>
 
       <AppButton
-        v-if="!serviceRunning"
+        v-if="!serviceInstalled"
         size="sm"
         tone="ghost"
         :loading="installing"

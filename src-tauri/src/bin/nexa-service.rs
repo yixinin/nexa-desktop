@@ -4,8 +4,8 @@ use nexa_lib::service::runner::ServiceRunner;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Shares the log directory with the service process (%APPDATA%/nexa/logs); a distinct
-    // prefix keeps it from clashing with the UI process
+    // The service has its own root-owned log directory; a distinct prefix also keeps the two
+    // rolling files apart when both binaries are run manually during development.
     let _guard = nexa_lib::init_tracing_in(nexa_lib::service_log_dir(), "nexa-service.log");
 
     let mut args: Vec<String> = std::env::args().collect();
@@ -54,6 +54,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!("Starting as daemon");
                 #[cfg(unix)]
                 daemonize();
+                run_service().await?;
+                return Ok(());
+            }
+            "--foreground" => {
+                tracing::info!("Starting as foreground service");
                 run_service().await?;
                 return Ok(());
             }

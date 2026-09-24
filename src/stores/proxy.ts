@@ -54,6 +54,7 @@ const nodeId = ref('');
 const busy = ref(false);
 const startupError = ref<AppError | null>(null);
 const serviceRunning = ref(false);
+const serviceInstalled = ref(false);
 
 /**
  * How each node is currently reaching its backend, filled in from the Rust side while the proxy
@@ -273,13 +274,20 @@ async function stop(): Promise<void> {
  * (§5.12 rule 3), and the answer changes when the service is installed, uninstalled, or dies.
  */
 async function refreshServiceRunning(): Promise<void> {
-  try {
-    serviceRunning.value = await invoke<boolean>('is_service_running');
-  } catch (error) {
-    // Infallible on the backend side; reaching here means the invoke itself failed.
-    serviceRunning.value = false;
-    console.error('[proxy] failed to query the service:', error);
-  }
+  const [running, state] = await Promise.all([
+    invoke<boolean>('is_service_running').catch((error) => {
+      console.error('[proxy] failed to query the service:', error);
+      return false;
+    }),
+    invoke<'not_installed' | 'stopped' | 'running'>('get_service_status').catch(() => {
+      // The service manager is unavailable; treat the service as absent for install controls.
+      return 'not_installed' as const;
+    }),
+  ]);
+  serviceRunning.value = running;
+  // Installed and answering are different facts: the install button disappears as soon as the
+  // unit exists, while TUN stays gated on the IPC connection actually being usable.
+  serviceInstalled.value = state !== 'not_installed';
 
   // TUN cannot run without the service, so an uninstalled service must not leave a latent
   // request behind (rule 3): the toggle flips back off and says why.
@@ -413,6 +421,7 @@ export function useProxyStore() {
     busy,
     startupError,
     serviceRunning,
+    serviceInstalled,
     /** What each node's traffic is actually doing right now. */
     endpointLinks,
     /** The mode the last start asked for; compared against what actually runs. */

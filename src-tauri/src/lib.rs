@@ -34,20 +34,36 @@ struct LogCursor {
     offset: u64,
 }
 
-/// Log directory: %APPDATA%/nexa/logs on Windows, the temp directory elsewhere
+/// Log directory for the desktop process: `%APPDATA%\nexa\logs` on Windows and the user's
+/// XDG state directory on Unix.
+///
+/// This is deliberately per-user and never shared with [`service_log_dir`]. A root service must
+/// not create the directory first and leave the desktop user unable to write its own log there.
 pub fn log_dir() -> std::path::PathBuf {
-    std::env::var("APPDATA")
-        .map(|d| std::path::Path::new(&d).join("nexa").join("logs"))
-        .unwrap_or_else(|_| std::env::temp_dir().join("nexa"))
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .map(|d| std::path::Path::new(&d).join("nexa").join("logs"))
+            .unwrap_or_else(|_| std::env::temp_dir().join("nexa").join("logs"))
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir());
+        base.join("nexa").join("logs")
+    }
 }
 
 /// Where the *service* writes its log.
 ///
-/// Not `log_dir()`: the service runs as LocalSystem, whose `APPDATA` is
-/// `C:\Windows\System32\config\systemprofile\AppData\Roaming` — a directory even an administrator
-/// has to fight to open, so the one log that explains a service-mode start failure was the one
-/// nobody could read. `ProgramData` is writable by the service and readable by the user, which is
-/// what a log is for. Unix services run as root, so there the two are the same file.
+/// Not [`log_dir()`]: the service runs as LocalSystem on Windows and root on Unix, while the
+/// desktop process runs as the logged-in user. Keeping the two apart means a service startup
+/// failure can always write its diagnostic without taking ownership of the user's log directory.
 pub fn service_log_dir() -> std::path::PathBuf {
     #[cfg(windows)]
     {
@@ -57,11 +73,14 @@ pub fn service_log_dir() -> std::path::PathBuf {
     }
     #[cfg(not(windows))]
     {
-        log_dir()
+        std::path::PathBuf::from("/var/log/nexa-service")
     }
 }
 
 /// [`init_tracing`] pointed at a directory of the caller's choosing; see [`service_log_dir`].
+///
+/// Logging is allowed to degrade to stdout when the directory or file cannot be created. A
+/// missing log file must never prevent either binary from starting.
 pub fn init_tracing_in(dir: std::path::PathBuf, prefix: &str) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -69,9 +88,27 @@ pub fn init_tracing_in(dir: std::path::PathBuf, prefix: &str) -> tracing_appende
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    let _ = std::fs::create_dir_all(&dir);
-    let file_appender = tracing_appender::rolling::daily(&dir, prefix);
-    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let file_appender = match std::fs::create_dir_all(&dir) {
+        Ok(()) => tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(prefix)
+            .build(&dir)
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    let (file_writer, guard) = match file_appender {
+        Ok(appender) => tracing_appender::non_blocking(appender),
+        Err(error) => {
+            eprintln!(
+                "failed to initialize log file in {}: {}; continuing with stdout logging",
+                dir.display(),
+                error
+            );
+            // The stdout layer below remains active, so this writer is only a harmless sink for
+            // the file layer and keeps the returned guard type uniform.
+            tracing_appender::non_blocking(std::io::sink())
+        }
+    };
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
@@ -86,7 +123,7 @@ pub fn init_tracing_in(dir: std::path::PathBuf, prefix: &str) -> tracing_appende
 }
 
 /// Initializes logging: info level by default (override with RUST_LOG), writing both to the
-/// console and to a log file (%APPDATA%/nexa/logs/{prefix}.log.YYYY-MM-DD).
+/// console and to a daily rolling file below [`log_dir()`].
 /// The returned guard must be kept alive for the log flushing thread to keep running.
 pub fn init_tracing(prefix: &str) -> tracing_appender::non_blocking::WorkerGuard {
     init_tracing_in(log_dir(), prefix)
@@ -560,8 +597,13 @@ struct LogPage {
 
 /// Picks the most recently modified `nexa.log` file in `dir` (daily rolling: `nexa.log.YYYY-MM-DD`).
 fn newest_log_file(dir: &std::path::Path) -> Result<Option<std::path::PathBuf>, AppError> {
-    Ok(std::fs::read_dir(dir)
-        .map_err(|e| AppError::cause(codes::LOGS_DIR_UNREADABLE, e))?
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(AppError::cause(codes::LOGS_DIR_UNREADABLE, error)),
+    };
+
+    Ok(entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {

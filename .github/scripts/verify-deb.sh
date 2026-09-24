@@ -46,6 +46,7 @@ for deb in "${debs[@]}"; do
 
     # Upgrade: stop the running service before unpacking and restore its previous state.
     require_text "$work/preinst" 'systemctl is-active --quiet "$SERVICE"'
+    require_text "$work/preinst" 'systemctl is-activating --quiet "$SERVICE"'
     require_text "$work/preinst" 'systemctl stop "$SERVICE"'
     require_text "$work/postinst" 'systemctl daemon-reload'
     require_text "$work/postinst" 'systemctl restart "$SERVICE"'

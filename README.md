@@ -156,8 +156,9 @@ the UI can say exactly why TUN could not start.
   connection around 50 Mbps at 200 ms RTT. Overrides without a rebuild:
   `NEXAPIPE_QUIC_STREAM_WINDOW`, `NEXAPIPE_QUIC_SEND_WINDOW`,
   `NEXAPIPE_QUIC_INITIAL_MTU`, `NEXAPIPE_QUIC_KEEPALIVE_MS`.
-- **Logs**: `%APPDATA%/nexa/logs` on Windows (temp directory elsewhere),
-  rotated daily; `RUST_LOG` controls the level.
+- **Logs**: `%APPDATA%/nexa/logs` on Windows and `$XDG_STATE_HOME/nexa/logs`
+  (or `~/.local/state/nexa/logs`) for the desktop app on Unix; the service writes
+  to `/var/log/nexa-service`. Files rotate daily; `RUST_LOG` controls the level.
 - **i18n**: `en` is the source of truth and the fallback. `lint:i18n` fails the
   build on a key that exists in one locale only.
 - Design notes for the UI refactor live in

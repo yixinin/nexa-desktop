@@ -124,8 +124,12 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
 pub fn read_tokens() -> Result<Vec<String>, AppError> {
     let mut tokens = Vec::new();
     for candidate in service_token_paths() {
-        if let Some(token) = read_token_at(&candidate)? {
-            tokens.push(token);
+        // A root service scans every desktop session candidate. One inaccessible profile must
+        // not make every other session's valid token unusable.
+        match read_token_at(&candidate) {
+            Ok(Some(token)) => tokens.push(token),
+            Ok(None) => {}
+            Err(_) => continue,
         }
     }
     Ok(tokens)
@@ -167,6 +171,42 @@ fn service_token_paths() -> Vec<PathBuf> {
 
     #[cfg(windows)]
     paths.extend(profile_token_paths());
+
+    #[cfg(not(windows))]
+    paths.extend(unix_service_token_paths());
+
+    paths
+}
+
+/// User-session token locations a root service can discover on Unix.
+///
+/// The desktop writes into XDG_RUNTIME_DIR/nexapipe/ipc.token, while a systemd system service
+/// has a root runtime directory and would otherwise look only under /root. Scanning the
+/// per-session runtime roots and the conventional cache fallback keeps both sides on the same
+/// secret without moving a private token to a shared directory.
+#[cfg(not(windows))]
+fn unix_service_token_paths() -> Vec<PathBuf> {
+    unix_service_token_paths_from([
+        std::path::PathBuf::from("/run/user"),
+        std::path::PathBuf::from("/home"),
+    ])
+}
+
+#[cfg(not(windows))]
+fn unix_service_token_paths_from(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            paths.push(path.join(TOKEN_DIR).join(TOKEN_FILE));
+            paths.push(path.join(".cache").join(TOKEN_DIR).join(TOKEN_FILE));
+        }
+    }
 
     paths
 }
