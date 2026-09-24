@@ -683,9 +683,7 @@ fn stop_elevated() -> Result<(), AppError> {
 /// Absolute path of the running executable, which is what the service manager is pointed at.
 #[cfg(not(windows))]
 fn current_exe_string() -> Result<String, AppError> {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))
+    elevate::current_executable().map(|p| p.to_string_lossy().to_string())
 }
 
 #[cfg(target_os = "linux")]
