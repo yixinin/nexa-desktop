@@ -372,7 +372,7 @@ jobs:
         run: node ui-desktop/.github/scripts/assemble-release.mjs
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           # Pre-release versions containing a hyphen (e.g. v0.2.0-rc.1) are marked as
