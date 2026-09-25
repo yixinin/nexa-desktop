@@ -108,7 +108,7 @@ jobs:
 
     steps:
       - name: Checkout nexapipe-desktop
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: ui-desktop
 
@@ -354,7 +354,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: ui-desktop
 

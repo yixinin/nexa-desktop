@@ -49,7 +49,7 @@ jobs:
       # "The specified node version file ... does not exist"，
       # 后面的 working-directory: ui-desktop 也会一起挂。
       # check / rust / audit 三个 job 都是这么写的，这里保持一致。
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: ui-desktop
 
@@ -93,7 +93,7 @@ jobs:
 
     steps:
       - name: Checkout nexapipe-desktop
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: ui-desktop
 
@@ -185,7 +185,7 @@ jobs:
 
     steps:
       - name: Checkout nexapipe-desktop
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           path: ui-desktop
 
@@ -253,7 +253,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: ui-desktop
 
