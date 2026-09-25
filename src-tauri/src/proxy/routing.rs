@@ -717,32 +717,50 @@ fn parse_ifconfig_addresses(text: &str, skip: &str) -> Vec<Ipv4Addr> {
 }
 
 /// `ip -o -4 addr show` lines: `<idx>: <ifname>[@<peer>] inet <addr>/<prefix> ...`.
+///
+/// Two shapes have to be accepted. Modern iproute2 with `-o` puts the interface name and the
+/// address on one line; older builds keep the trailing colon after the name, and plain
+/// `ip addr show` splits them into an unindented `<idx>: <ifname>: <flags>` header plus indented
+/// `inet ...` lines below it. Parsing only the first shape silently returned an empty list on
+/// the other two, which made the candidate-block conflict check a no-op.
 #[cfg(target_os = "linux")]
 fn parse_ip_addr_addresses(text: &str, skip: &str) -> Vec<Ipv4Addr> {
     let mut out = Vec::new();
+    // Interface the indented lines below belong to (multi-line output only).
+    let mut current: Option<&str> = None;
     for line in text.lines() {
-        let mut fields = line.split_whitespace();
-        if fields.next().is_none() {
-            continue;
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if !indented {
+            current = interface_field_name(tokens.get(1).copied());
         }
-        let Some(ifname) = fields.next().map(|n| n.split('@').next().unwrap_or(n)) else {
+        // `inet` matched exactly, so `inet6` lines never land here.
+        let Some(pos) = tokens.iter().position(|t| *t == "inet") else {
             continue;
         };
-        if fields.next() != Some("inet") {
-            continue;
-        }
-        let Some(addr) = fields
-            .next()
+        let Some(addr) = tokens
+            .get(pos + 1)
             .and_then(|a| a.split('/').next())
             .and_then(|a| a.parse().ok())
         else {
             continue;
         };
-        if ifname != skip {
+        let owner = if indented {
+            current
+        } else {
+            interface_field_name(tokens.get(1).copied())
+        };
+        if owner != Some(skip) {
             out.push(addr);
         }
     }
     out
+}
+
+/// `<ifname>[@<peer>][:]` — the peer suffix and the colon some iproute2 versions print.
+#[cfg(target_os = "linux")]
+fn interface_field_name(token: Option<&str>) -> Option<&str> {
+    token.map(|n| n.split('@').next().unwrap_or(n).trim_end_matches(':'))
 }
 
 /// Whether `ip` can be bound within a short grace period — the same test the DNS server has to
@@ -856,8 +874,16 @@ nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
     #[cfg(target_os = "linux")]
     #[test]
     fn a_foreign_address_inside_a_candidate_block_is_collected() {
-        let text = "\
-1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
+        // `ip -o -4 addr show`: the interface and its address share one line, and the record is
+        // continued with a trailing backslash.
+        let oneline = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: enp3s0    inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0\\       valid_lft forever preferred_lft forever
+9: tun0    inet 198.18.0.1/30 scope global tun0\\       valid_lft forever preferred_lft forever
+10: nexa-tun    inet 198.18.0.254/24 scope global nexa-tun\\       valid_lft forever preferred_lft forever
+";
+        // Plain `ip addr show`, plus the trailing colon older iproute2 keeps even under `-o`:
+        // an unindented header names the interface, indented lines carry the addresses.
+        let multiline = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536
     inet 127.0.0.1/8 scope host lo
 2: enp3s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
     inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0
@@ -866,9 +892,20 @@ nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
 10: nexa-tun: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400
     inet 198.18.0.254/24 scope global nexa-tun
 ";
-        let foreign = super::parse_ip_addr_addresses(text, "nexa-tun");
-        assert!(foreign.contains(&"198.18.0.1".parse().unwrap()));
-        assert!(foreign.contains(&"10.0.0.83".parse().unwrap()));
-        assert!(!foreign.contains(&"198.18.0.254".parse().unwrap()));
+        for text in [oneline, multiline] {
+            let foreign = super::parse_ip_addr_addresses(text, "nexa-tun");
+            assert!(
+                foreign.contains(&"198.18.0.1".parse().unwrap()),
+                "the conflicting foreign address was not collected: {foreign:?}"
+            );
+            assert!(
+                foreign.contains(&"10.0.0.83".parse().unwrap()),
+                "an unrelated LAN address was not collected: {foreign:?}"
+            );
+            assert!(
+                !foreign.contains(&"198.18.0.254".parse().unwrap()),
+                "our own interface must be excluded: {foreign:?}"
+            );
+        }
     }
 }
