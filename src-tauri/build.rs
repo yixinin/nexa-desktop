@@ -1,3 +1,6 @@
+// Only referenced from the Windows block in `main()`. Without this gate the function is dead
+// code on Linux/macOS, which CI's `clippy -D warnings` turns into a hard error.
+#[cfg(target_os = "windows")]
 fn target_arch_dir() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
