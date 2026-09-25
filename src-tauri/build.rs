@@ -1,7 +1,3 @@
-use std::env;
-use std::fs;
-use std::path::Path;
-
 fn target_arch_dir() -> &'static str {
     #[cfg(target_arch = "x86_64")]
     {
@@ -39,6 +35,13 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
+        // Scoped to this block: everything below is Windows-only, so importing these at
+        // file level makes them unused (and a hard error under `-D warnings`) on
+        // Linux/macOS CI.
+        use std::env;
+        use std::fs;
+        use std::path::Path;
+
         let arch_dir = target_arch_dir();
         let wintun_src = format!("wintun/bin/{}/wintun.dll", arch_dir);
         let out_dir = env::var("OUT_DIR").unwrap();
