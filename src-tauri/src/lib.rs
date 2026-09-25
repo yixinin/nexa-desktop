@@ -54,7 +54,7 @@ pub fn log_dir() -> std::path::PathBuf {
                 std::env::var_os("HOME")
                     .map(|home| std::path::PathBuf::from(home).join(".local").join("state"))
             })
-            .unwrap_or_else(|| std::env::temp_dir());
+            .unwrap_or_else(std::env::temp_dir);
         base.join("nexa").join("logs")
     }
 }
